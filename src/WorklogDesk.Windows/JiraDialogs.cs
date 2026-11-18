@@ -117,7 +117,7 @@ internal sealed class JiraConfigDialog : Form
 
 internal sealed class JiraIssueDialog : Form
 {
-    private static readonly JiraIssue[] DemoIssues =
+    internal static readonly JiraIssue[] DemoIssues =
     [
         new("NW-243", "Review Business Central deployment", "In Progress"),
         new("CED-118", "Reply to customer with restore details", "Waiting for Customer"),

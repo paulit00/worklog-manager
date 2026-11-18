@@ -205,16 +205,51 @@ internal sealed class WindowsObserver : NativeWindow, IDisposable
         if (family.Length == 0)
             return null;
 
-        var mapped = Match(window, family, app, preferences.Mappings);
+        // The raw title stays in memory. Only its normalized form is kept, encrypted, as review context.
+        var raw = preferences.WindowTitles || preferences.Mappings is { Length: > 0 } ? ReadTitle(window) : "";
+        var context = preferences.WindowTitles ? WindowContext.Normalize(raw) : "";
+        var mapped = Match(raw, family, app, preferences.Mappings);
+        // Remote Desktop titles are host names such as BC-01, so they never count as issue keys.
+        if (preferences.WindowTitles && family != "Remote Desktop" &&
+            WindowContext.DetectIssue(raw, Projects(preferences.Jira)) is { } key)
+        {
+            var summary = WindowContext.JiraSummary(context, key);
+            mapped = (mapped ?? new TaskLabel()) with
+            {
+                Issue = key,
+                Description = summary.Length > 0 ? summary : mapped?.Issue == key ? mapped.Description : ""
+            };
+        }
         if (family is "Outlook" or "Teams")
-            return new CaptureSource(family, mapped);
+            return new CaptureSource(family, mapped, Context: context);
         var pinned = Pin?.Invoke(mapped);
         if (mapped != null && pinned != null && Conflicts(mapped, pinned))
         {
             PinConflict?.Invoke();
-            return new CaptureSource(family + " · pin conflict", Kind: SpanKind.Uncertain);
+            return new CaptureSource(family + " · pin conflict", Kind: SpanKind.Uncertain, Context: context);
         }
-        return new CaptureSource(family, pinned ?? mapped);
+        return new CaptureSource(family, pinned ?? mapped, Context: context);
+    }
+
+    private string? projectText;
+    private HashSet<string>? projectSet;
+
+    private HashSet<string>? Projects(JiraSettings? jira)
+    {
+        var text = jira?.Projects ?? "";
+        if (!ReferenceEquals(text, projectText))
+        {
+            projectText = text;
+            projectSet = text.Split([',', ' ', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(key => key.ToUpperInvariant()).ToHashSet(StringComparer.Ordinal);
+        }
+        return projectSet;
+    }
+
+    private static string ReadTitle(nint window)
+    {
+        var title = new StringBuilder(512);
+        return GetWindowText(window, title, title.Capacity) > 0 ? title.ToString() : "";
     }
 
     private string AppName(uint processId)
@@ -240,17 +275,14 @@ internal sealed class WindowsObserver : NativeWindow, IDisposable
         _ = ReadLastInput(Environment.TickCount64);
     }
 
-    private static TaskLabel? Match(nint window, string family, string app, SourceMapping[]? mappings)
+    private static TaskLabel? Match(string title, string family, string app, SourceMapping[]? mappings)
     {
-        if (mappings == null || (family is not ("VS Code" or "Remote Desktop") && app != "msedge"))
+        if (mappings == null || title.Length == 0 || (family is not ("VS Code" or "Remote Desktop") && app != "msedge"))
             return null;
         var candidates = mappings.Where(mapping => mapping.App == family).ToArray();
         if (candidates.Length == 0)
             return null;
-        var title = new StringBuilder(512);
-        if (GetWindowText(window, title, title.Capacity) <= 0)
-            return null;
-        var parts = title.ToString().Split([" - ", " — "], StringSplitOptions.TrimEntries);
+        var parts = title.Split([" - ", " — "], StringSplitOptions.TrimEntries);
         var matches = candidates.Where(candidate => parts.Contains(candidate.Alias, StringComparer.OrdinalIgnoreCase))
             .Select(candidate => candidate.Task).Distinct().Take(2).ToArray();
         return matches.Length == 1 ? matches[0] : null;

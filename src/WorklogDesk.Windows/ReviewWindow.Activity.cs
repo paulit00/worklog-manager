@@ -35,21 +35,66 @@ internal sealed partial class ReviewWindow
             Notify($"Kept {Duration(remainders.Sum(item => item.Milliseconds))} trimmed from the row as unassigned time.");
     }
 
-    private void AssignSelected()
+    /// <summary>Test seam replacing the assign window; returns the chosen task and disposition, or null to cancel.</summary>
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    internal Func<TaskLabel, (TaskLabel, Disposition)?>? AssignOverride { get; set; }
+
+    internal void AssignSelected()
     {
-        var selected = AssignableSelection(out var skipped);
+        var selected = Selected();
         if (selected.Length == 0)
         {
-            Notify("Select activity rows first.");
+            Notify(tabs.SelectedIndex == 0 ? "Select one or more activity rows first." : "Assign works on the Activity view.");
             return;
         }
-        using var dialog = new TaskDialog("Assign selected activity", selected[0].Task, recent: RecentTasks());
-        if (dialog.ShowDialog(this) != DialogResult.OK)
+        var clients = selected.Select(row => row.Task.Client).Where(value => value.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var issues = selected.Select(row => row.Task.Issue).Where(value => value.Length > 0).Distinct().ToArray();
+        var descriptions = selected.Select(row => row.Task.Description).Where(value => value.Length > 0).Distinct().ToArray();
+        var initial = new TaskLabel(clients.Length == 1 ? clients[0] : "", issues.Length == 1 ? issues[0] : "",
+            descriptions.Length == 1 ? descriptions[0] : "");
+        var caption = $"Assign {selected.Length} row(s) · {Duration(selected.Sum(row => row.Milliseconds))}";
+        TaskLabel task;
+        Disposition choice;
+        if (AssignOverride != null)
+        {
+            if (AssignOverride(initial) is not { } answer)
+                return;
+            (task, choice) = answer;
+        }
+        else
+        {
+            using var dialog = new AssignDialog(caption, initial, IssueChoices(selected), app.JiraIssues, app.OpenCatalog, app.IsDemo);
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+                return;
+            choice = dialog.Choice;
+            task = dialog.Result;
+        }
+        if (choice is Disposition.Internal or Disposition.Excluded)
+        {
+            ClassifySelected(choice, selected);
             return;
-        var disposition = TaskLabel.ValidIssue(dialog.Task.Issue) ? Disposition.Billable : Disposition.Unassigned;
-        var updated = selected.Select(row => row with { Status = disposition, Task = dialog.Task, Approved = false }).ToArray();
-        Save([], updated);
-        ReportSkipped(skipped);
+        }
+        // An explicit assignment settles uncertain timing for those rows; idle rows become reviewed passive work.
+        Save([], selected.Select(row => row with
+        {
+            Status = choice, Approved = false,
+            Kind = row.Kind == SpanKind.Uncertain ? SpanKind.Foreground : row.Kind,
+            Task = task with { Client = task.Client.Length > 0 ? task.Client : row.Task.Client, Link = row.Task.Link }
+        }).ToArray(), "assignment");
+        Notify(choice == Disposition.Billable
+            ? $"Assigned {selected.Length} row(s) to {task.Issue}. Ctrl+Z undoes it."
+            : $"Set the client on {selected.Length} row(s). Pick an issue to make them billable.");
+    }
+
+    /// <summary>Suggestions for the selection first, then today's issues, the pin and mapped standing issues.</summary>
+    private IReadOnlyList<IssueChoice> IssueChoices(IReadOnlyList<Allocation> selected)
+    {
+        var suggested = selected.Where(row => suggestions.ContainsKey(row.Id)).Select(row => suggestions[row.Id])
+            .Select(task => new IssueChoice(task.Issue, task.Description, "Suggested", task.Client, task.Description));
+        var recent = RecentTasks().Select(task => new IssueChoice(task.Issue, task.Description,
+            task.Client.Length > 0 ? $"Recent · {task.Client}" : "Recent", task.Client, task.Description));
+        return suggested.Concat(recent).Where(item => TaskLabel.ValidIssue(item.Key))
+            .DistinctBy(item => (item.Key, item.Client.ToUpperInvariant())).ToArray();
     }
 
     internal IReadOnlyList<TaskLabel> RecentTasks()
@@ -62,100 +107,57 @@ internal sealed partial class ReviewWindow
             .DistinctBy(task => (task.Issue, task.Client.ToUpperInvariant(), task.Description)).Take(12).ToArray();
     }
 
-    private Allocation[] AssignableSelection(out int skipped)
+    /// <summary>
+    /// Assigns suggested rows to the issue detected next to them. With a selection that contains suggestions,
+    /// only those rows change; otherwise every suggestion for the day is accepted. Approval stays a separate step.
+    /// </summary>
+    internal void AcceptSuggestions()
     {
-        var selected = Selected();
-        var eligible = selected.Length == 1 ? selected :
-            selected.Where(row => row.Kind is not (SpanKind.Uncertain or SpanKind.Idle) &&
-                row.Status != Disposition.Excluded).ToArray();
-        skipped = selected.Length - eligible.Length;
-        if (eligible.Length == 0 && skipped > 0)
-            Notify("Review idle, excluded or uncertain rows individually.");
-        return eligible;
-    }
-
-    private void ReportSkipped(int skipped)
-    {
-        if (skipped > 0)
-            Notify($"Left {skipped} idle, excluded or uncertain row(s) unchanged.");
-    }
-
-    private void ShowClassifier()
-    {
-        if (Selected().Length == 0)
+        var selectedIds = Selected().Select(row => row.Id).Where(suggestions.ContainsKey).ToHashSet(StringComparer.Ordinal);
+        var targets = rows.Where(row => suggestions.ContainsKey(row.Id) &&
+            (selectedIds.Count == 0 || selectedIds.Contains(row.Id))).ToArray();
+        if (targets.Length == 0)
         {
-            Notify("Select activity rows first.");
+            Notify("No suggestions. Rows get one when a detected Jira issue is open within 30 minutes of them.");
             return;
         }
-        using var dialog = new Form { Text = "Classify selected activity", StartPosition = FormStartPosition.CenterParent,
-            ClientSize = new Size(332, 66), FormBorderStyle = FormBorderStyle.FixedDialog, ShowInTaskbar = false,
-            MinimizeBox = false, MaximizeBox = false };
-        var buttons = Flow();
-        var disposition = Disposition.Unassigned;
-        void Choose(Disposition value) { disposition = value; dialog.DialogResult = DialogResult.OK; }
-        var cancel = Ui.Button("Cancel", (_, _) => dialog.Close(), 90);
-        cancel.DialogResult = DialogResult.Cancel;
-        dialog.CancelButton = cancel;
-        buttons.Controls.AddRange([Ui.Button("Internal", (_, _) => Choose(Disposition.Internal), 93),
-            Ui.Button("Exclude", (_, _) => Choose(Disposition.Excluded), 91),
-            cancel]);
-        dialog.Controls.Add(buttons);
-        if (dialog.ShowDialog(this) == DialogResult.OK)
-            ClassifySelected(disposition);
+        var minutes = Duration(targets.Sum(row => row.Milliseconds));
+        Save([], targets.Select(row => row with
+        {
+            Status = Disposition.Billable,
+            Task = suggestions[row.Id] with { Client = row.Task.Client.Length > 0 ? row.Task.Client : suggestions[row.Id].Client },
+            Approved = false
+        }).ToArray(), "accepting suggestions");
+        Notify($"Assigned {targets.Length} row(s), {minutes}, to their suggested issues. Ctrl+Z undoes it.");
     }
 
-    private void ClassifySelected(Disposition disposition)
+    private void ClassifySelected(Disposition disposition, Allocation[]? rowsToChange = null)
     {
-        var selected = Selected();
+        var selected = rowsToChange ?? Selected();
         if (selected.Length == 0)
             return;
         if ((selected.Any(row => row.Approved) || disposition == Disposition.Internal && selected.Any(row => row.Kind == SpanKind.Uncertain))
             && MessageBox.Show(this, "This will change approved or unresolved time. Continue?",
                 "Confirm classification", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
             return;
-        Save([], selected.Select(row => row with { Status = disposition, Approved = false }).ToArray());
+        Save([], selected.Select(row => row with { Status = disposition, Approved = false }).ToArray(),
+            disposition == Disposition.Internal ? "marking internal" : "excluding");
     }
 
-    private void FindIssue()
+    private void LinkRequest()
     {
-        var selected = AssignableSelection(out var skipped);
-        var draft = tabs.SelectedIndex == 2 ? requests.CurrentRow?.Tag as RequestDraft : null;
-        if (draft == null && (tabs.SelectedIndex != 0 || selected.Length == 0))
+        if (requests.CurrentRow?.Tag is not RequestDraft draft)
         {
-            Notify("Select activity or a saved request before finding an issue.");
+            Notify("Select a saved request first.");
             return;
         }
-        try
-        {
-            using var catalog = app.OpenCatalog();
-            var initial = draft?.Task.Issue ?? selected.FirstOrDefault()?.Task.Issue ?? "";
-            using var dialog = new JiraIssueDialog(catalog, initial);
-            if (dialog.ShowDialog(this) != DialogResult.OK || dialog.SelectedIssue is not { } issue)
-                return;
-            if (draft != null)
-            {
-                store.SaveRequest(draft with { Task = draft.Task with { Issue = issue.Key } });
-                Reload();
-                Notify($"Linked request to {issue.Key}.");
-            }
-            else
-            {
-                Save([], selected.Select(row => row with
-                {
-                    Status = Disposition.Billable, Approved = false,
-                    Task = row.Task with
-                    {
-                        Issue = issue.Key,
-                        Description = row.Task.Description.Length == 0 ? issue.Summary : row.Task.Description
-                    }
-                }).ToArray());
-                ReportSkipped(skipped);
-            }
-        }
-        catch (Exception error) when (error is ArgumentException or InvalidOperationException)
-        {
-            Notify(error.Message);
-        }
+        using var dialog = new AssignDialog("Link request to a Jira issue", draft.Task, IssueChoices([]), app.JiraIssues,
+            app.OpenCatalog, app.IsDemo, allowClassify: false);
+        if (dialog.ShowDialog(this) != DialogResult.OK || !TaskLabel.ValidIssue(dialog.Result.Issue))
+            return;
+        store.SaveRequest(draft with { Task = dialog.Result });
+        Reload();
+        Notify($"Linked request to {dialog.Result.Issue}.");
     }
 
     private void OpenJiraForm()
@@ -222,7 +224,8 @@ internal sealed partial class ReviewWindow
             Notify("Approval cancelled.");
             return;
         }
-        Save([], selected.Select(row => row with { Approved = true, ApprovedMode = Mode, ApprovedKey = approvalKeys[row.Id] }).ToArray());
+        Save([], selected.Select(row => row with { Approved = true, ApprovedMode = Mode, ApprovedKey = approvalKeys[row.Id] }).ToArray(),
+            "approval");
     }
 
     private void AddTime()

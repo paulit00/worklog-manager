@@ -12,7 +12,7 @@ internal sealed record Preferences(
     bool Recording = false, bool Browser = false, bool Developer = true, bool Remote = true,
     bool Communications = false, int IdleMinutes = 2, int WorkdayMinutes = 480,
     string TimeZoneId = "", RoundingMode Rounding = RoundingMode.IssueDay,
-    SourceMapping[]? Mappings = null, JiraSettings? Jira = null);
+    SourceMapping[]? Mappings = null, JiraSettings? Jira = null, bool WindowTitles = true, string Theme = "Dark");
 
 internal sealed record RequestDraft(string Id, DateOnly Day, TaskLabel Task);
 internal sealed record ExportReceipt(string Issue, WorkInterval[] Intervals);
@@ -20,8 +20,10 @@ internal sealed record ExportReceipt(string Issue, WorkInterval[] Intervals);
 internal sealed class WorkStore : IDisposable
 {
     private readonly SqliteConnection connection;
-    private const int SchemaVersion = 4;
+    private const int SchemaVersion = 5;
+    private const int ContextRetentionDays = 30;
     private readonly Dictionary<TaskLabel, string> knownTasks = [];
+    private readonly Dictionary<string, string> knownContexts = new(StringComparer.Ordinal);
 
     public WorkStore(string folder, bool inMemory = false)
     {
@@ -58,6 +60,7 @@ internal sealed class WorkStore : IDisposable
             CREATE INDEX IF NOT EXISTS assigned_end ON allocation(ended) WHERE status IN (1,2);
             CREATE INDEX IF NOT EXISTS unassigned_day ON allocation(day) WHERE status=0;
             CREATE TABLE IF NOT EXISTS task (id TEXT PRIMARY KEY, payload BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS context (id TEXT PRIMARY KEY, payload BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS setting (name TEXT PRIMARY KEY, value BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS request (id TEXT PRIMARY KEY, day TEXT NOT NULL, payload BLOB NOT NULL);
             CREATE INDEX IF NOT EXISTS request_day ON request(day);
@@ -75,7 +78,29 @@ internal sealed class WorkStore : IDisposable
             using var addKey = Command("ALTER TABLE allocation ADD COLUMN approved_key TEXT; PRAGMA user_version=4;", migration);
             addKey.ExecuteNonQuery();
         }
+        if (version < 5)
+        {
+            using var addContext = Command("ALTER TABLE allocation ADD COLUMN context_id TEXT; PRAGMA user_version=5;", migration);
+            addContext.ExecuteNonQuery();
+        }
         migration.Commit();
+        PurgeContext(DateOnly.FromDateTime(DateTime.Today).AddDays(-ContextRetentionDays));
+    }
+
+    /// <summary>Drops window context recorded before the cutoff day. Attribution and approved time stay.</summary>
+    public void PurgeContext(DateOnly before)
+    {
+        using var transaction = connection.BeginTransaction();
+        using var clear = Command("UPDATE allocation SET context_id=NULL WHERE context_id IS NOT NULL AND day < $day",
+            transaction, ("$day", FormatDay(before)));
+        var cleared = clear.ExecuteNonQuery();
+        if (cleared > 0)
+        {
+            using var orphan = Command("DELETE FROM context WHERE NOT EXISTS (SELECT 1 FROM allocation WHERE context_id=context.id)", transaction);
+            orphan.ExecuteNonQuery();
+        }
+        transaction.Commit();
+        knownContexts.Clear();
     }
 
     public Preferences Preferences()
@@ -123,16 +148,26 @@ internal sealed class WorkStore : IDisposable
     public List<Allocation> Rows(DateOnly day)
     {
         using var command = Command("""
-            SELECT a.id,a.started,a.ended,a.app,a.kind,a.status,a.approved,t.id,t.payload,a.approved_mode,a.approved_key
-            FROM allocation a LEFT JOIN task t ON a.task_id=t.id
+            SELECT a.id,a.started,a.ended,a.app,a.kind,a.status,a.approved,t.id,t.payload,a.approved_mode,a.approved_key,
+                c.id,c.payload
+            FROM allocation a LEFT JOIN task t ON a.task_id=t.id LEFT JOIN context c ON a.context_id=c.id
             WHERE day=$day ORDER BY started,a.id
             """,
             null, ("$day", FormatDay(day)));
         using var reader = command.ExecuteReader();
         var rows = new List<Allocation>();
         var tasks = new Dictionary<string, TaskLabel>(StringComparer.Ordinal);
+        var contexts = new Dictionary<string, string>(StringComparer.Ordinal);
         while (reader.Read())
         {
+            var context = "";
+            if (!reader.IsDBNull(11))
+            {
+                var id = reader.GetString(11);
+                if (!contexts.TryGetValue(id, out var cachedContext))
+                    contexts[id] = cachedContext = Unprotect<string>((byte[])reader[12]);
+                context = cachedContext;
+            }
             var task = new TaskLabel();
             if (!reader.IsDBNull(7))
             {
@@ -144,7 +179,8 @@ internal sealed class WorkStore : IDisposable
             rows.Add(new Allocation(reader.GetString(0), day, new DateTimeOffset(reader.GetInt64(1), TimeSpan.Zero),
                 new DateTimeOffset(reader.GetInt64(2), TimeSpan.Zero), reader.GetString(3), (SpanKind)reader.GetInt32(4),
                 (Disposition)reader.GetInt32(5), task, reader.GetBoolean(6),
-                reader.IsDBNull(9) ? null : (RoundingMode)reader.GetInt32(9), reader.IsDBNull(10) ? null : reader.GetString(10)));
+                reader.IsDBNull(9) ? null : (RoundingMode)reader.GetInt32(9), reader.IsDBNull(10) ? null : reader.GetString(10),
+                context));
         }
         return rows;
     }
@@ -177,8 +213,12 @@ internal sealed class WorkStore : IDisposable
                 throw new InvalidOperationException("This interval overlaps time already assigned to a task.");
             SaveAllocation(row, transaction, taskIds);
         }
-        using var cleanup = Command("DELETE FROM task WHERE NOT EXISTS (SELECT 1 FROM allocation WHERE task_id=task.id)", transaction);
+        using var cleanup = Command("""
+            DELETE FROM task WHERE NOT EXISTS (SELECT 1 FROM allocation WHERE task_id=task.id);
+            DELETE FROM context WHERE NOT EXISTS (SELECT 1 FROM allocation WHERE context_id=context.id);
+            """, transaction);
         cleanup.ExecuteNonQuery();
+        knownContexts.Clear();
         transaction.Commit();
         knownTasks.Clear();
         RememberTasks(taskIds);
@@ -305,14 +345,25 @@ internal sealed class WorkStore : IDisposable
             }
             taskIds.Add(row.Task, taskId);
         }
+        string? contextId = null;
+        if (row.Context.Length > 0 && !knownContexts.TryGetValue(row.Context, out contextId))
+        {
+            contextId = Guid.NewGuid().ToString("N");
+            using var context = Command("INSERT INTO context VALUES ($id,$payload)", transaction,
+                ("$id", contextId), ("$payload", Protect(row.Context)));
+            context.ExecuteNonQuery();
+            if (knownContexts.Count > 512)
+                knownContexts.Clear();
+            knownContexts[row.Context] = contextId;
+        }
         using var command = Command("""
-            INSERT INTO allocation (id,day,started,ended,status,app,kind,approved,task_id,approved_mode,approved_key)
-            VALUES ($id,$day,$start,$end,$status,$app,$kind,$approved,$task,$mode,$key)
+            INSERT INTO allocation (id,day,started,ended,status,app,kind,approved,task_id,approved_mode,approved_key,context_id)
+            VALUES ($id,$day,$start,$end,$status,$app,$kind,$approved,$task,$mode,$key,$context)
             ON CONFLICT(id) DO UPDATE SET day=excluded.day, started=excluded.started, ended=excluded.ended,
                 status=excluded.status, app=excluded.app, kind=excluded.kind,
                 approved=excluded.approved, task_id=excluded.task_id, approved_mode=excluded.approved_mode,
-                approved_key=excluded.approved_key
-            """, transaction, ("$id", row.Id), ("$day", FormatDay(row.Day)), ("$start", row.Start.UtcTicks),
+                approved_key=excluded.approved_key, context_id=excluded.context_id
+            """, transaction, ("$context", contextId is null ? DBNull.Value : contextId), ("$id", row.Id), ("$day", FormatDay(row.Day)), ("$start", row.Start.UtcTicks),
             ("$end", row.End.UtcTicks), ("$status", (int)row.Status), ("$app", row.App), ("$kind", (int)row.Kind),
             ("$approved", row.Approved), ("$task", taskId is null ? DBNull.Value : taskId),
             ("$mode", row.ApprovedMode.HasValue ? (int)row.ApprovedMode.Value : DBNull.Value),

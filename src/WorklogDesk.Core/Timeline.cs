@@ -20,14 +20,18 @@ public sealed record TaskLabel(string Client = "", string Issue = "", string Des
         uri.Scheme == Uri.UriSchemeHttps && string.IsNullOrEmpty(uri.UserInfo);
 }
 
-public sealed record CaptureSource(string App, TaskLabel? Task = null, SpanKind Kind = SpanKind.Foreground);
+/// <param name="Context">Normalized window titles seen in the span; review context only, never part of attribution.</param>
+public sealed record CaptureSource(string App, TaskLabel? Task = null, SpanKind Kind = SpanKind.Foreground, string Context = "")
+{
+    public bool SameAttribution(CaptureSource? other) => other != null && this with { Context = "" } == other with { Context = "" };
+}
 
 public sealed record WorkSpan(Guid Id, DateTimeOffset Start, DateTimeOffset End, CaptureSource Source);
 
 public sealed record Allocation(
     string Id, DateOnly Day, DateTimeOffset Start, DateTimeOffset End, string App,
     SpanKind Kind, Disposition Status, TaskLabel Task, bool Approved = false, RoundingMode? ApprovedMode = null,
-    string? ApprovedKey = null)
+    string? ApprovedKey = null, string Context = "")
 {
     public long Milliseconds => (End - Start).Ticks / TimeSpan.TicksPerMillisecond;
     public bool IsApprovedIn(RoundingMode mode) => Approved && ApprovedMode == mode;
@@ -84,7 +88,7 @@ public static class Timeline
                 _ => Disposition.Unassigned
             };
             yield return new Allocation($"{span.Id:N}-{start.UtcTicks}", day, start, end, span.Source.App,
-                kind, status, task);
+                kind, status, task, Context: span.Source.Context);
             start = end;
         }
     }
@@ -162,6 +166,36 @@ public static class Timeline
             Id = Guid.NewGuid().ToString("N"), Start = start, End = end, Status = Disposition.Unassigned,
             Task = new TaskLabel(), Approved = false, ApprovedMode = null, ApprovedKey = null
         };
+    }
+
+    /// <summary>
+    /// Suggests an issue for unassigned active rows from the nearest detected issue around them: the closest
+    /// assigned row before, else after, within the window. A row whose mapped client differs from that issue's
+    /// client gets no suggestion. Suggestions change nothing until the user accepts them.
+    /// </summary>
+    public static IReadOnlyDictionary<string, TaskLabel> Suggest(IReadOnlyList<Allocation> rows, TimeSpan? window = null)
+    {
+        var reach = window ?? TimeSpan.FromMinutes(30);
+        var anchors = rows.Where(row => row.Status == Disposition.Billable && TaskLabel.ValidIssue(row.Task.Issue))
+            .OrderBy(row => row.Start).ToArray();
+        var suggestions = new Dictionary<string, TaskLabel>(StringComparer.Ordinal);
+        if (anchors.Length == 0)
+            return suggestions;
+        foreach (var row in rows)
+        {
+            if (row.Status != Disposition.Unassigned || row.Kind is not (SpanKind.Foreground or SpanKind.Manual))
+                continue;
+            var before = anchors.LastOrDefault(anchor => anchor.End <= row.Start && row.Start - anchor.End <= reach);
+            var after = anchors.FirstOrDefault(anchor => anchor.Start >= row.End && anchor.Start - row.End <= reach);
+            var anchor = before ?? after;
+            if (anchor == null)
+                continue;
+            if (row.Task.Client.Length > 0 && anchor.Task.Client.Length > 0 &&
+                !StringComparer.OrdinalIgnoreCase.Equals(row.Task.Client, anchor.Task.Client))
+                continue;
+            suggestions[row.Id] = anchor.Task with { Link = "" };
+        }
+        return suggestions;
     }
 
     public static bool Intersects(Allocation left, Allocation right) =>

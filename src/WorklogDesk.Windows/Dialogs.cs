@@ -189,7 +189,13 @@ internal sealed class SettingsDialog : Form
     private readonly CheckBox developer = new() { Text = "VS Code and terminal / AI", AutoSize = true };
     private readonly CheckBox remote = new() { Text = "Remote Desktop", AutoSize = true };
     private readonly CheckBox communications = new() { Text = "Outlook and Teams foreground", AutoSize = true };
+    private readonly CheckBox titles = new()
+    {
+        Text = "Read window titles to detect Jira keys and show what was open (kept encrypted on this PC for 30 days)",
+        AutoSize = true
+    };
     private readonly NumericUpDown idle = new() { Minimum = 1, Maximum = 60 };
+    private readonly ComboBox theme = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 140, AccessibleName = "Appearance" };
     private readonly NumericUpDown target = new() { Minimum = 0, Maximum = 1440, Increment = 15 };
     private readonly DataGridView mappings = Ui.Grid();
 
@@ -201,8 +207,8 @@ internal sealed class SettingsDialog : Form
         Text = "Worklog Desk settings";
         Font = SystemFonts.MessageBoxFont ?? SystemFonts.DefaultFont;
         AutoScaleMode = AutoScaleMode.Dpi;
-        MinimumSize = new Size(620, 475);
-        Size = new Size(700, 510);
+        MinimumSize = new Size(700, 550);
+        Size = new Size(780, 590);
         StartPosition = FormStartPosition.CenterParent;
         ShowInTaskbar = false;
         var layout = Ui.DialogLayout();
@@ -211,12 +217,17 @@ internal sealed class SettingsDialog : Form
         developer.Checked = preferences.Developer;
         remote.Checked = preferences.Remote;
         communications.Checked = preferences.Communications;
+        titles.Checked = preferences.WindowTitles;
+        theme.Items.AddRange(["Dark", "Light", "System"]);
+        theme.SelectedItem = theme.Items.Contains(preferences.Theme) ? preferences.Theme : "Dark";
         idle.Value = Math.Clamp(preferences.IdleMinutes, 1, 60);
         target.Value = Math.Clamp(preferences.WorkdayMinutes, 0, 1440);
         Ui.Field(layout, "Sources", browser);
         Ui.Field(layout, "", developer);
         Ui.Field(layout, "", remote);
         Ui.Field(layout, "", communications);
+        Ui.Field(layout, "Automatic", titles);
+        Ui.Field(layout, "Appearance", theme);
         Ui.Field(layout, "Idle cutoff (minutes)", idle);
         Ui.Field(layout, "Daily target (minutes)", target);
         Ui.Field(layout, "Workday timezone", new Label { Text = preferences.TimeZoneId, AutoSize = true });
@@ -285,7 +296,7 @@ internal sealed class SettingsDialog : Form
             approved.Add(new SourceMapping(app, alias, new TaskLabel(client, issue)));
         }
         Result = Result with { Browser = browser.Checked, Developer = developer.Checked, Remote = remote.Checked,
-            Communications = communications.Checked, IdleMinutes = (int)idle.Value, WorkdayMinutes = (int)target.Value,
+            Communications = communications.Checked, WindowTitles = titles.Checked, Theme = (string)theme.SelectedItem!, IdleMinutes = (int)idle.Value, WorkdayMinutes = (int)target.Value,
             Mappings = approved.ToArray() };
         DialogResult = DialogResult.OK;
     }
@@ -351,13 +362,87 @@ internal sealed class SplitDialog : Form
     }
 }
 
+/// <summary>Colors that follow the app's light or dark mode. System colors already switch; these are the custom ones.</summary>
+internal static class Palette
+{
+#pragma warning disable WFO5001
+    public static bool Dark => Application.IsDarkModeEnabled;
+#pragma warning restore WFO5001
+    public static Color Surface => Dark ? Color.FromArgb(25, 26, 29) : Color.FromArgb(246, 248, 251);
+    public static Color Card => Dark ? Color.FromArgb(37, 39, 44) : Color.White;
+    public static Color Heading => Dark ? Color.FromArgb(236, 239, 244) : Color.FromArgb(19, 37, 61);
+    public static Color Text => Dark ? Color.FromArgb(222, 226, 232) : Color.FromArgb(23, 44, 71);
+    public static Color Muted => Dark ? Color.FromArgb(160, 168, 180) : Color.FromArgb(62, 75, 93);
+    public static Color Row => Dark ? Color.FromArgb(31, 33, 37) : Color.White;
+    public static Color AltRow => Dark ? Color.FromArgb(37, 39, 44) : Color.FromArgb(246, 249, 252);
+    public static Color Header => Dark ? Color.FromArgb(44, 47, 53) : Color.FromArgb(236, 240, 245);
+    public static Color GridLine => Dark ? Color.FromArgb(52, 55, 62) : Color.FromArgb(225, 229, 235);
+    public static Color Selection => Dark ? Color.FromArgb(38, 79, 140) : SystemColors.Highlight;
+    public static Color AttentionBack => Dark ? Color.FromArgb(74, 56, 22) : Color.FromArgb(255, 243, 215);
+    public static Color AttentionText => Dark ? Color.FromArgb(255, 213, 145) : Color.FromArgb(85, 49, 11);
+    public static Color SuggestionBack => Dark ? Color.FromArgb(28, 58, 74) : Color.FromArgb(222, 240, 250);
+    public static Color SuggestionText => Dark ? Color.FromArgb(150, 214, 245) : Color.FromArgb(14, 64, 92);
+
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(nint window, int attribute, ref int value, int size);
+
+    /// <summary>Gives a window a dark title bar in dark mode (Windows 10 20H1 and later).</summary>
+    public static void TitleBar(Form form)
+    {
+        form.HandleCreated += (_, _) =>
+        {
+            var dark = Dark ? 1 : 0;
+            _ = DwmSetWindowAttribute(form.Handle, 20, ref dark, sizeof(int));
+        };
+    }
+
+    /// <summary>Applies the chosen appearance. Windows opened afterwards use it.</summary>
+    public static void Apply(string theme)
+    {
+#pragma warning disable WFO5001
+        try
+        {
+            Application.SetColorMode(theme switch
+            {
+                "Light" => SystemColorMode.Classic,
+                "System" => SystemColorMode.System,
+                _ => SystemColorMode.Dark
+            });
+        }
+        catch (InvalidOperationException) { }
+#pragma warning restore WFO5001
+    }
+}
+
 internal static class Ui
 {
     public static Button Button(string text, EventHandler handler, int width = 100)
     {
-        var button = new Button { Text = text, Width = width, Height = 32, Margin = new Padding(3, 3, 4, 3) };
+        var button = new Button
+        {
+            Text = text, Width = width, Height = 32, Margin = new Padding(3, 3, 4, 3), FlatStyle = FlatStyle.Flat,
+            BackColor = Palette.Card, ForeColor = Palette.Text, UseVisualStyleBackColor = false
+        };
+        button.FlatAppearance.BorderColor = Palette.GridLine;
+        button.FlatAppearance.MouseOverBackColor = Palette.Header;
+        button.EnabledChanged += (_, _) => button.ForeColor = button.Enabled ? Palette.Text : Palette.Muted;
         button.Click += handler;
         return button;
+    }
+
+    /// <summary>Marks the main action of a view.</summary>
+    public static void Primary(Button button)
+    {
+        var accent = Palette.Dark ? Color.FromArgb(45, 108, 196) : Color.FromArgb(28, 92, 186);
+        button.BackColor = accent;
+        button.ForeColor = Color.White;
+        button.FlatAppearance.BorderColor = accent;
+        button.FlatAppearance.MouseOverBackColor = Palette.Dark ? Color.FromArgb(62, 126, 214) : Color.FromArgb(45, 108, 196);
+        button.EnabledChanged += (_, _) =>
+        {
+            button.BackColor = button.Enabled ? accent : Palette.Card;
+            button.ForeColor = button.Enabled ? Color.White : Palette.Muted;
+        };
     }
 
     public static DataGridView Grid() => new()
@@ -365,10 +450,22 @@ internal static class Ui
         Dock = DockStyle.Fill, ReadOnly = true, MultiSelect = true, RowHeadersVisible = false,
         SelectionMode = DataGridViewSelectionMode.FullRowSelect, AllowUserToAddRows = false,
         AllowUserToDeleteRows = false, AllowUserToResizeRows = false,
-        AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, BackgroundColor = SystemColors.Window,
-        BorderStyle = BorderStyle.FixedSingle, RowTemplate = { Height = 27 },
-        CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
-        AlternatingRowsDefaultCellStyle = { BackColor = SystemInformation.HighContrast ? SystemColors.Window : Color.FromArgb(246, 249, 252) }
+        AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, BackgroundColor = Palette.Row,
+        BorderStyle = BorderStyle.None, RowTemplate = { Height = 28 },
+        CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal, GridColor = Palette.GridLine,
+        EnableHeadersVisualStyles = false, ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None,
+        ColumnHeadersHeight = 32, ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
+        ColumnHeadersDefaultCellStyle =
+        {
+            BackColor = Palette.Header, ForeColor = Palette.Muted, SelectionBackColor = Palette.Header,
+            SelectionForeColor = Palette.Muted, Padding = new Padding(4, 0, 0, 0)
+        },
+        DefaultCellStyle =
+        {
+            BackColor = Palette.Row, ForeColor = Palette.Text, SelectionBackColor = Palette.Selection,
+            SelectionForeColor = Color.White, Padding = new Padding(4, 0, 0, 0)
+        },
+        AlternatingRowsDefaultCellStyle = { BackColor = SystemInformation.HighContrast ? SystemColors.Window : Palette.AltRow }
     };
 
     public static TableLayoutPanel DialogLayout()

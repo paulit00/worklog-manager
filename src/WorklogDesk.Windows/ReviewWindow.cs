@@ -16,12 +16,13 @@ internal sealed partial class ReviewWindow : Form
     private readonly Label actual = SummaryLabel();
     private readonly Label attention = SummaryLabel();
     private readonly Label proposed = SummaryLabel();
-    private readonly Label message = new() { AutoSize = true, ForeColor = Color.FromArgb(62, 75, 93) };
-    private readonly Label roundingComparison = new() { AutoSize = true, ForeColor = Color.FromArgb(62, 75, 93) };
+    private readonly Label message = new() { AutoSize = true, ForeColor = Palette.Muted };
+    private readonly Label roundingComparison = new() { AutoSize = true, ForeColor = Palette.Muted };
     private readonly DataGridView activity = Ui.Grid();
     private readonly DataGridView worklogs = Ui.Grid();
     private readonly DataGridView requests = Ui.Grid();
-    private readonly TabControl tabs = new() { Dock = DockStyle.Fill };
+    private readonly TabControl tabs = new PageHost { Dock = DockStyle.Fill };
+    private readonly Button dateButton = Ui.Button("", (_, _) => { }, 230);
     private readonly ComboBox rounding = new() { Width = 155, DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly CheckBox needsReview = new() { Text = "Needs review only", AutoSize = true };
     private readonly CheckBox groupActivity = new() { Text = "Group adjoining", Checked = true, AutoSize = true };
@@ -38,6 +39,11 @@ internal sealed partial class ReviewWindow : Form
     private HashSet<string> approvedIds = [];
     private HashSet<string> staleApprovalIds = [];
     private Dictionary<string, string> approvalKeys = [];
+    private sealed record UndoStep(DateOnly Day, string[] Added, Allocation[] Before, string Label);
+    private readonly Stack<UndoStep> undo = new();
+    private readonly Button undoButton = Ui.Button("Undo", (_, _) => { }, 76);
+    private readonly Button acceptSuggestions = Ui.Button("Accept suggestions", (_, _) => { }, 150);
+    private IReadOnlyDictionary<string, TaskLabel> suggestions = new Dictionary<string, TaskLabel>();
     private Dictionary<Worklog, ManualCoverage> coverages = [];
     private ExportReceipt[] handoffs = [];
     private HashSet<string> correctionCopies = [];
@@ -58,7 +64,10 @@ internal sealed partial class ReviewWindow : Form
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = SystemFonts.MessageBoxFont ?? SystemFonts.DefaultFont;
-        BackColor = Color.FromArgb(246, 248, 251);
+        BackColor = Palette.Surface;
+        ForeColor = Palette.Text;
+        Palette.TitleBar(this);
+        KeyPreview = true;
 
         var shell = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(23), ColumnCount = 1, RowCount = 6 };
         shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -78,7 +87,7 @@ internal sealed partial class ReviewWindow : Form
         var heading = new Label
         {
             Text = "Worklog Desk", AutoSize = true, Font = new Font("Segoe UI", 23, FontStyle.Bold),
-            ForeColor = Color.FromArgb(19, 37, 61)
+            ForeColor = Palette.Heading
         };
         status.Anchor = AnchorStyles.Left;
         status.Margin = new Padding(4, 0, 0, 15);
@@ -107,9 +116,19 @@ internal sealed partial class ReviewWindow : Form
         var next = Ui.Button("›", (_, _) => ChangeDay(Day.AddDays(1)), 36);
         next.AccessibleName = "Next day";
         date.Value = app.Today.ToDateTime(TimeOnly.MinValue);
-        date.Margin = new Padding(4, 8, 4, 4);
-        date.ValueChanged += (_, _) => Reload();
-        navigation.Controls.AddRange([previous, date, next,
+        date.Visible = false;
+        // The native date picker can't be themed, so a button shows the date and opens a calendar.
+        dateButton.Text = DateText();
+        dateButton.AccessibleName = "Workday date";
+        dateButton.Click += (_, _) => PickDate();
+        date.ValueChanged += (_, _) =>
+        {
+            dateButton.Text = DateText();
+            undo.Clear();
+            undoButton.Enabled = false;
+            Reload();
+        };
+        navigation.Controls.AddRange([previous, dateButton, date, next,
             Ui.Button("Today", (_, _) => ChangeDay(app.Today), 69),
             Ui.Button("Oldest unassigned", (_, _) => GoToUnreviewed(), 142)]);
         shell.Controls.Add(navigation, 0, 1);
@@ -123,39 +142,60 @@ internal sealed partial class ReviewWindow : Form
         shell.Controls.Add(totals, 0, 2);
 
         var commands = Flow();
-        var edit = Ui.Button("Edit row", (_, _) => EditSelected(), 100);
-        var assign = Ui.Button("Assign selected", (_, _) => AssignSelected(), 125);
-        var find = Ui.Button("Find Jira", (_, _) => FindIssue(), 83);
+        var views = new[] { ViewButton("Activity", 0), ViewButton("Worklogs", 1), ViewButton("Requests", 2) };
+        views[0].Checked = true;
+        var viewBar = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 0, 18, 0) };
+        viewBar.Controls.AddRange(views);
+        var assign = Ui.Button("Assign…", (_, _) => AssignSelected(), 96);
+        Ui.Primary(assign);
+        Ui.Primary(acceptSuggestions);
         var approve = Ui.Button("Approve", (_, _) => ApproveSelected(), 89);
-        var add = Ui.Button("Add time", (_, _) => AddTime(), 90);
-        var split = Ui.Button("Split row", (_, _) => SplitSelected(), 84);
-        var mark = Ui.Button("Mark entered in Tempo", (_, _) => MarkEntered(), 172);
-        var approveLine = Ui.Button("Approve line", (_, _) => ApproveWorklogs(), 104);
-        approveLine.Visible = false;
-        var classify = Ui.Button("Classify…", (_, _) => ShowClassifier(), 92);
-        mark.Visible = false;
-        commands.Controls.AddRange([edit, assign, find, classify, approve, add, split, approveLine, mark,
-            Ui.Button("Capture request", (_, _) => app.QuickRequest(), 125)]);
-        needsReview.Margin = new Padding(8, 9, 2, 0);
+        undoButton.Click += (_, _) => Undo();
+        undoButton.Enabled = false;
+        var moreMenu = new ContextMenuStrip();
+        moreMenu.Items.Add(new ToolStripMenuItem("Edit times…", null, (_, _) => EditSelected()) { ShortcutKeyDisplayString = "F2" });
+        moreMenu.Items.Add("Split row…", null, (_, _) => SplitSelected());
+        moreMenu.Items.Add("Merge adjacent rows", null, (_, _) => MergeSelected());
+        moreMenu.Items.Add("Add time…", null, (_, _) => AddTime());
+        var more = Ui.Button("More ▾", (_, _) => { }, 84);
+        more.Click += (_, _) => moreMenu.Show(more, new Point(0, more.Height));
+        var mark = Ui.Button("Mark entered", (_, _) => MarkEntered(), 120);
+        var approveLine = Ui.Button("Approve line", (_, _) => ApproveWorklogs(), 110);
+        var copyLine = Ui.Button("Copy for Tempo", (_, _) => CopyWorklog(), 126);
+        Ui.Primary(copyLine);
+        acceptSuggestions.Click += (_, _) => AcceptSuggestions();
+        var newRequest = Ui.Button("New request", (_, _) => app.QuickRequest(), 110);
+        var linkRequest = Ui.Button("Link to Jira…", (_, _) => LinkRequest(), 116);
+        var editRequest = Ui.Button("Edit request", (_, _) => EditRequest(), 106);
+        var jiraForm = Ui.Button("Open Jira create form", (_, _) => OpenJiraForm(), 166);
+        commands.Controls.AddRange([viewBar, acceptSuggestions, assign, approve, more, approveLine, copyLine, mark,
+            newRequest, linkRequest, editRequest, jiraForm, undoButton]);
+        needsReview.Margin = new Padding(10, 9, 2, 0);
         needsReview.CheckedChanged += (_, _) => LoadActivity();
         commands.Controls.Add(needsReview);
         groupActivity.Margin = new Padding(8, 9, 2, 0);
         groupActivity.CheckedChanged += (_, _) => LoadActivity();
         commands.Controls.Add(groupActivity);
-        tabs.SelectedIndexChanged += (_, _) =>
+        void ShowCommands()
         {
-            var onActivity = tabs.SelectedIndex == 0;
-            foreach (var control in new Control[] { assign, classify, approve, add, split, needsReview, groupActivity })
-                control.Visible = onActivity;
-            edit.Visible = find.Visible = tabs.SelectedIndex != 1;
-            edit.Text = onActivity ? "Edit row" : "Edit request";
-            mark.Visible = approveLine.Visible = tabs.SelectedIndex == 1;
-        };
+            var view = tabs.SelectedIndex;
+            foreach (var control in new Control[] { acceptSuggestions, assign, approve, more, needsReview, groupActivity })
+                control.Visible = view == 0;
+            foreach (var control in new Control[] { approveLine, copyLine, mark })
+                control.Visible = view == 1;
+            foreach (var control in new Control[] { newRequest, linkRequest, editRequest, jiraForm })
+                control.Visible = view == 2;
+            undoButton.Visible = view != 2;
+            if (view >= 0 && view < views.Length)
+                views[view].Checked = true;
+        }
+        tabs.SelectedIndexChanged += (_, _) => ShowCommands();
+        ShowCommands();
         shell.Controls.Add(commands, 0, 3);
 
         activity.AccessibleName = "Daily activity";
-        AddColumns(activity, ("Time", 120), ("Actual", 66), ("Source", 105), ("Client", 95),
-            ("Jira issue", 85), ("Description", 155), ("State", 100));
+        AddColumns(activity, ("Time", 120), ("Actual", 66), ("Source and window", 210), ("Client", 90),
+            ("Jira issue", 85), ("Description", 150), ("State", 110));
         activity.VirtualMode = true;
         foreach (DataGridViewColumn activityColumn in activity.Columns)
             activityColumn.SortMode = DataGridViewColumnSortMode.NotSortable;
@@ -164,29 +204,40 @@ internal sealed partial class ReviewWindow : Form
             if (e.RowIndex >= 0 && e.RowIndex < visibleActivity.Length)
                 e.Value = ActivityCell(visibleActivity[e.RowIndex], e.ColumnIndex);
         };
-        activity.CellDoubleClick += (_, e) => { if (e.RowIndex >= 0) EditSelected(); };
+        activity.CellDoubleClick += (_, e) => { if (e.RowIndex >= 0) AssignSelected(); };
         activity.KeyDown += (_, e) =>
         {
             if (e.KeyCode is Keys.Enter or Keys.F2)
             {
                 e.SuppressKeyPress = true;
-                EditSelected();
+                if (e.KeyCode == Keys.Enter)
+                    AssignSelected();
+                else
+                    EditSelected();
             }
         };
         activity.CellFormatting += (_, e) =>
         {
             if (!SystemInformation.HighContrast && e.ColumnIndex == 6 &&
-                e.Value is "Needs assignment" or "Check timing" or "Review idle gap")
+                e.Value is "Needs assignment" or "Check timing" or "Review idle gap" ||
+                e.ColumnIndex == 6 && e.Value is string state && state.StartsWith("Suggested", StringComparison.Ordinal))
             {
-                e.CellStyle!.BackColor = Color.FromArgb(255, 243, 215);
-                e.CellStyle.ForeColor = Color.FromArgb(85, 49, 11);
+                var suggested = e.Value is string text && text.StartsWith("Suggested", StringComparison.Ordinal);
+                e.CellStyle!.BackColor = suggested ? Palette.SuggestionBack : Palette.AttentionBack;
+                e.CellStyle.ForeColor = suggested ? Palette.SuggestionText : Palette.AttentionText;
             }
         };
         var activityMenu = new ContextMenuStrip();
-        activityMenu.Items.Add("Edit activity", null, (_, _) => EditSelected());
+        activityMenu.Items.Add(new ToolStripMenuItem("Assign…", null, (_, _) => AssignSelected()) { ShortcutKeyDisplayString = "Enter" });
+        activityMenu.Items.Add("Accept suggestion", null, (_, _) => AcceptSuggestions());
+        activityMenu.Items.Add("Approve", null, (_, _) => ApproveSelected());
+        activityMenu.Items.Add(new ToolStripSeparator());
+        activityMenu.Items.Add("Mark internal", null, (_, _) => ClassifySelected(Disposition.Internal));
+        activityMenu.Items.Add("Exclude", null, (_, _) => ClassifySelected(Disposition.Excluded));
+        activityMenu.Items.Add(new ToolStripSeparator());
+        activityMenu.Items.Add(new ToolStripMenuItem("Edit times…", null, (_, _) => EditSelected()) { ShortcutKeyDisplayString = "F2" });
+        activityMenu.Items.Add("Split row…", null, (_, _) => SplitSelected());
         activityMenu.Items.Add("Merge adjacent rows", null, (_, _) => MergeSelected());
-        activityMenu.Items.Add("Mark selected internal", null, (_, _) => ClassifySelected(Disposition.Internal));
-        activityMenu.Items.Add("Exclude selected", null, (_, _) => ClassifySelected(Disposition.Excluded));
         activity.ContextMenuStrip = activityMenu;
         AddTab("Activity", activity);
 
@@ -252,7 +303,7 @@ internal sealed partial class ReviewWindow : Form
             }
         };
         var requestMenu = new ContextMenuStrip();
-        requestMenu.Items.Add("Find or link existing issue", null, (_, _) => FindIssue());
+        requestMenu.Items.Add("Link to Jira…", null, (_, _) => LinkRequest());
         requestMenu.Items.Add("Open Jira create form", null, (_, _) => OpenJiraForm());
         requests.ContextMenuStrip = requestMenu;
         AddTab("Requests", requests);
@@ -272,10 +323,6 @@ internal sealed partial class ReviewWindow : Form
         bottom.Controls.Add(new Label { Text = "Rounding preview", AutoSize = true, Margin = new Padding(2, 11, 6, 0) });
         bottom.Controls.Add(rounding);
         bottom.Controls.Add(Ui.Button("Export approved CSV", (_, _) => Export(), 151));
-        var copy = Ui.Button("Copy worklog", (_, _) => CopyWorklog(), 109);
-        copy.Visible = false;
-        tabs.SelectedIndexChanged += (_, _) => copy.Visible = tabs.SelectedIndex == 1;
-        bottom.Controls.Add(copy);
         roundingComparison.Margin = new Padding(8, 11, 0, 0);
         bottom.Controls.Add(roundingComparison);
         message.Margin = new Padding(8, 11, 0, 0);
@@ -348,6 +395,9 @@ internal sealed partial class ReviewWindow : Form
         var cursor = priorIndex >= 0 && priorIndex < visibleActivity.Length ? visibleActivity[priorIndex][0].Id : null;
         var column = activity.CurrentCell?.ColumnIndex ?? 0;
         var scroll = activity.FirstDisplayedScrollingRowIndex;
+        suggestions = Timeline.Suggest(rows);
+        acceptSuggestions.Text = suggestions.Count == 0 ? "Accept suggestions" : $"Accept suggestions ({suggestions.Count})";
+        acceptSuggestions.Enabled = suggestions.Count > 0;
         var visible = rows.Where(row => !needsReview.Checked ||
             (!approvedIds.Contains(row.Id) && row.Status is not (Disposition.Internal or Disposition.Excluded)));
         visibleActivity = ActivityGroups(visible).ToArray();
@@ -375,13 +425,21 @@ internal sealed partial class ReviewWindow : Form
         {
             0 => Range(row with { End = group[^1].End }),
             1 => Duration(group.Sum(item => item.Milliseconds)),
-            2 => group.Length == 1 ? row.App : $"{row.App} ({group.Length})",
+            2 => SourceText(group),
             3 => row.Task.Client,
-            4 => row.Task.Issue,
+            4 => row.Task.Issue.Length == 0 && suggestions.TryGetValue(row.Id, out var hint) ? hint.Issue + "?" : row.Task.Issue,
             5 => row.Task.Description,
-            6 => State(row),
+            6 => row.Status == Disposition.Unassigned && suggestions.TryGetValue(row.Id, out var suggested)
+                ? $"Suggested {suggested.Issue}" : State(row),
             _ => ""
         };
+    }
+
+    private static string SourceText(Allocation[] group)
+    {
+        var app = group.Length == 1 ? group[0].App : $"{group[0].App} ({group.Length})";
+        var context = group.Select(item => item.Context).FirstOrDefault(value => value.Length > 0);
+        return context == null ? app : $"{app} · {context}";
     }
 
     private IEnumerable<Allocation[]> ActivityGroups(IEnumerable<Allocation> source)
@@ -476,6 +534,8 @@ internal sealed partial class ReviewWindow : Form
             : $"Issue/day {Duration(issueDay * 1000L)}  ·  Sessions {Duration(sessions * 1000L)}. Use your team’s rule.";
     }
 
+    internal Allocation[] ActivityAt(int index) => index >= 0 && index < visibleActivity.Length ? visibleActivity[index] : [];
+
     internal object? WorklogAt(int index) => index >= 0 && index < visibleWorklogs.Length ? visibleWorklogs[index].Item : null;
 
     private void ChangeDay(DateOnly day)
@@ -498,11 +558,17 @@ internal sealed partial class ReviewWindow : Form
             .Where(index => index >= 0 && index < visibleActivity.Length)
             .SelectMany(index => visibleActivity[index]).OrderBy(row => row.Start).ToArray();
 
-    private void Save(IReadOnlyCollection<string> removed, IReadOnlyCollection<Allocation> updated)
+    private void Save(IReadOnlyCollection<string> removed, IReadOnlyCollection<Allocation> updated, string label = "change")
     {
         try
         {
+            var current = rows.ToDictionary(row => row.Id, StringComparer.Ordinal);
+            var before = removed.Concat(updated.Select(row => row.Id)).Distinct(StringComparer.Ordinal)
+                .Where(current.ContainsKey).Select(id => current[id]).ToArray();
+            var added = updated.Select(row => row.Id).Where(id => !current.ContainsKey(id)).ToArray();
             store.ReplaceRows(removed, updated);
+            undo.Push(new UndoStep(Day, added, before, label));
+            undoButton.Enabled = true;
             Reload();
         }
         catch (InvalidOperationException error)
@@ -516,6 +582,30 @@ internal sealed partial class ReviewWindow : Form
     }
 
     private void Notify(string text) => message.Text = text;
+
+    /// <summary>Restores the rows as they were before the last change on this day: assignment, suggestions, approval, edits.</summary>
+    internal void Undo()
+    {
+        if (!undo.TryPop(out var step) || step.Day != Day)
+        {
+            undo.Clear();
+            undoButton.Enabled = false;
+            Notify("Nothing to undo.");
+            return;
+        }
+        try
+        {
+            store.ReplaceRows(step.Added, step.Before);
+            Notify($"Undid {step.Label}.");
+        }
+        catch (Exception error) when (error is InvalidOperationException or Microsoft.Data.Sqlite.SqliteException)
+        {
+            undo.Clear();
+            Notify("That change can't be undone any more: " + error.Message);
+        }
+        undoButton.Enabled = undo.Count > 0;
+        Reload();
+    }
 
     private string Range(Allocation row)
     {
@@ -549,9 +639,69 @@ internal sealed partial class ReviewWindow : Form
 
     private void AddTab(string name, DataGridView table)
     {
-        var tab = new TabPage(name) { Padding = new Padding(5) };
+        var tab = new TabPage(name) { Padding = new Padding(0, 4, 0, 0), BackColor = Palette.Surface };
         tab.Controls.Add(table);
         tabs.TabPages.Add(tab);
+    }
+
+    private string DateText() => date.Value.ToString("dddd, d MMMM yyyy") + "  ▾";
+
+    private void PickDate()
+    {
+        var calendar = new MonthCalendar { MaxSelectionCount = 1, SelectionStart = date.Value, ShowToday = true };
+        var host = new ToolStripControlHost(calendar) { Margin = Padding.Empty, Padding = Padding.Empty };
+        var drop = new ToolStripDropDown { Padding = Padding.Empty };
+        drop.Items.Add(host);
+        calendar.DateSelected += (_, e) =>
+        {
+            drop.Close();
+            ChangeDay(DateOnly.FromDateTime(e.Start));
+        };
+        drop.Closed += (_, _) => BeginInvoke(drop.Dispose);
+        drop.Show(dateButton, new Point(0, dateButton.Height));
+    }
+
+    /// <summary>A tab control without its tab strip or border; view buttons switch pages.</summary>
+    private sealed class PageHost : TabControl
+    {
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x1328 && !DesignMode) // TCM_ADJUSTRECT: let pages fill the whole control.
+            {
+                m.Result = 1;
+                return;
+            }
+            base.WndProc(ref m);
+        }
+    }
+
+    private RadioButton ViewButton(string text, int index)
+    {
+        var button = new RadioButton
+        {
+            Text = text, Appearance = Appearance.Button, FlatStyle = FlatStyle.Flat, TextAlign = ContentAlignment.MiddleCenter,
+            Width = 96, Height = 32, Margin = new Padding(0, 3, 0, 3), BackColor = Palette.Card, ForeColor = Palette.Text
+        };
+        button.FlatAppearance.BorderColor = Palette.GridLine;
+        button.FlatAppearance.CheckedBackColor = Palette.Selection;
+        button.FlatAppearance.MouseOverBackColor = Palette.Header;
+        button.CheckedChanged += (_, _) =>
+        {
+            button.ForeColor = button.Checked ? Color.White : Palette.Text;
+            if (button.Checked && tabs.SelectedIndex != index)
+                tabs.SelectedIndex = index;
+        };
+        return button;
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == (Keys.Control | Keys.Z) && ActiveControl is not TextBoxBase)
+        {
+            Undo();
+            return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
     }
 
     private static void AddColumns(DataGridView view, params (string Text, int Width)[] columns)
@@ -565,7 +715,7 @@ internal sealed partial class ReviewWindow : Form
     private static Label SummaryLabel() => new()
     {
         Text = "—", AutoSize = true, Dock = DockStyle.Fill, Padding = new Padding(10),
-        BackColor = SystemColors.Window, ForeColor = Color.FromArgb(23, 44, 71),
+        BackColor = Palette.Card, ForeColor = Palette.Text,
         Font = new Font("Segoe UI", 12, FontStyle.Bold), Margin = new Padding(2)
     };
 }

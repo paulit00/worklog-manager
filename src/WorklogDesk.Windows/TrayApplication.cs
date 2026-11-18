@@ -33,6 +33,7 @@ internal sealed class TrayApplication : ApplicationContext
     public DateOnly Today => Timeline.DayOf(DateTimeOffset.UtcNow, Zone);
     public bool RunningManual => manual != null;
     public bool IsDemo => demo;
+    public JiraIssueCache JiraIssues { get; } = new();
 
     public TrayApplication(string folder, bool demo, string instance, bool showOnStart = true, bool diagnostics = false,
         bool syntheticIdle = false)
@@ -41,6 +42,7 @@ internal sealed class TrayApplication : ApplicationContext
         this.syntheticIdle = syntheticIdle;
         store = new WorkStore(folder, inMemory: demo);
         Settings = store.Preferences();
+        Palette.Apply(Settings.Theme);
         Zone = TimeZoneInfo.FindSystemTimeZoneById(Settings.TimeZoneId);
         store.SavePreferences(Settings);
         interruptedManual = store.Recover(Zone);
@@ -76,7 +78,7 @@ internal sealed class TrayApplication : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.Add("Open review   Ctrl+Shift+Alt+L", null, (_, _) => ShowReview());
         menu.Items.Add("Pin task   Ctrl+Shift+Alt+P", null, (_, _) => EditPin());
-        menu.Items.Add("Capture request   Ctrl+Shift+Alt+N", null, (_, _) => QuickRequest());
+        menu.Items.Add("Note a request (no ticket yet)   Ctrl+Shift+Alt+N", null, (_, _) => QuickRequest());
         menu.Items.Add("Assign last RDP span", null, (_, _) => ShowReview(selectRemote: true));
         menu.Items.Add("Start / stop manual timer", null, (_, _) => ToggleManual());
         captureMenu = new ToolStripMenuItem("", null, (_, _) => ToggleCapture());
@@ -110,6 +112,18 @@ internal sealed class TrayApplication : ApplicationContext
         window.DrawToBitmap(bitmap, new Rectangle(0, 0, window.Width, window.Height));
         bitmap.Save(output, System.Drawing.Imaging.ImageFormat.Png);
         window.Hide();
+        // A second image shows the assign window as it opens for a suggested row.
+        using var assign = new AssignDialog("Assign 3 row(s) · 1h 03m", new TaskLabel("Northwind"),
+            [new IssueChoice("NW-243", "Review Business Central deployment", "Suggested", "Northwind", "Review Business Central deployment"),
+             new IssueChoice("CED-118", "Reply to customer with restore details", "Recent · Cedar", "Cedar")],
+            JiraIssues, OpenCatalog, demo: true) { StartPosition = FormStartPosition.Manual };
+        OpenOffscreen(assign);
+        for (var pump = 0; pump < 20; pump++)
+            Application.DoEvents();
+        using var dialogImage = new Bitmap(assign.Width, assign.Height);
+        assign.DrawToBitmap(dialogImage, new Rectangle(0, 0, assign.Width, assign.Height));
+        dialogImage.Save(Path.ChangeExtension(output, null) + "-assign.png", System.Drawing.Imaging.ImageFormat.Png);
+        assign.Hide();
     }
 
     internal double[] MeasureReview(RoundingMode? worklogMode = null)
@@ -198,7 +212,7 @@ internal sealed class TrayApplication : ApplicationContext
 
     public void QuickRequest()
     {
-        using var dialog = new TaskDialog("Capture request", new TaskLabel(pin?.Client ?? ""),
+        using var dialog = new TaskDialog("Note a request without a ticket", new TaskLabel(pin?.Client ?? ""),
             requireDescription: true, allowStart: true);
         if (dialog.ShowDialog(review) != DialogResult.OK)
             return;
@@ -228,8 +242,20 @@ internal sealed class TrayApplication : ApplicationContext
     public void EditSettings()
     {
         using var dialog = new SettingsDialog(Settings);
-        if (dialog.ShowDialog(review) == DialogResult.OK)
-            Apply(dialog.Result);
+        if (dialog.ShowDialog(review) != DialogResult.OK)
+            return;
+        var themeChanged = dialog.Result.Theme != Settings.Theme;
+        Apply(dialog.Result);
+        if (!themeChanged)
+            return;
+        // Reopen the review so every control picks up the new appearance.
+        Palette.Apply(Settings.Theme);
+        var reopen = review is { IsDisposed: false, Visible: true };
+        review?.Close();
+        review?.Dispose();
+        review = null;
+        if (reopen)
+            ShowReview();
     }
 
     public void ConnectJira()
@@ -239,6 +265,7 @@ internal sealed class TrayApplication : ApplicationContext
             return;
         var original = Settings.Jira;
         SaveSettings(Settings with { Jira = dialog.Result });
+        JiraIssues.Clear();
         review?.UpdateConnections();
         if (original != null && original.CredentialTarget != dialog.Result?.CredentialTarget)
             CredentialVault.Delete(original.CredentialTarget);

@@ -99,7 +99,8 @@ internal sealed class JiraCatalog : IDisposable
         var filters = new List<string>();
         if (projectKeys.Length > 0)
             filters.Add("project in (" + string.Join(",", projectKeys.Select(Quote)) + ")");
-        if (query.Mine || projectKeys.Length == 0)
+        // Without configured projects an empty search lists your own issues; text searches everyone's.
+        if (query.Mine || projectKeys.Length == 0 && term.Length == 0)
             filters.Add("assignee = currentUser()");
         filters.Add(query.WaitingOnly ? $"status = {Quote(config.WaitingStatus)}" : "statusCategory != Done");
         foreach (var word in term.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Take(12))

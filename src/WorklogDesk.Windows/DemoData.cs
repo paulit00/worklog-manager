@@ -14,12 +14,15 @@ internal static class DemoData
         var internalTask = new TaskLabel("Internal", "", "Review on-call handoff");
         var spans = new[]
         {
-            Span(0, 12, "VS Code", north), Span(12, 17, "Browser", north),
-            Span(17, 46, "Remote Desktop", north), Span(50, 57, "Remote Desktop"),
-            Span(58, 63, "Outlook", reply), Span(65, 92, "Terminal / AI", north),
+            Span(0, 12, "VS Code", north, context: "feature/NW-243-deploy - nw-bc-apps"),
+            Span(12, 17, "Browser", north, context: "[NW-243] Review Business Central deployment"),
+            Span(17, 46, "Remote Desktop", north with { Issue = "", Description = "" }, context: "NW-BCSQL01"),
+            Span(50, 57, "Remote Desktop", context: "CEDAR-BC-APP02"),
+            Span(58, 63, "Outlook", reply, context: "RE: CED-118 Restore details"),
+            Span(65, 92, "Terminal / AI", context: "pwsh - Publish-NavApp"),
             Span(92, 104, "Idle gap", kind: SpanKind.Idle), Span(104, 128, "Manual timer", reply, SpanKind.Manual),
-            Span(128, 128.125, "Browser"), Span(130, 142, "Teams", internalTask),
-            Span(147, 162, "VS Code"), Span(165, 175, "Browser")
+            Span(128, 128.125, "Browser"), Span(130, 142, "Teams", internalTask, context: "On-call handoff"),
+            Span(147, 162, "VS Code", context: "cedar-extensions"), Span(165, 175, "Browser", context: "Business Central admin center")
         };
         store.SaveCapture(spans, [], zone);
         var internalRow = store.Rows(day).Single(row => row.Task == internalTask);
@@ -29,8 +32,9 @@ internal static class DemoData
                 "https://teams.microsoft.com/")));
         store.SaveRequest(new RequestDraft(Guid.NewGuid().ToString("N"), day, reply));
 
-        WorkSpan Span(double start, double end, string source, TaskLabel? task = null, SpanKind kind = SpanKind.Foreground) =>
-            new(Guid.NewGuid(), morning.AddMinutes(start), morning.AddMinutes(end), new CaptureSource(source, task, kind));
+        WorkSpan Span(double start, double end, string source, TaskLabel? task = null, SpanKind kind = SpanKind.Foreground,
+            string context = "") =>
+            new(Guid.NewGuid(), morning.AddMinutes(start), morning.AddMinutes(end), new CaptureSource(source, task, kind, context));
     }
 }
 
@@ -62,7 +66,7 @@ internal static class Benchmark
             var time = start.AddSeconds(index * 8);
             var task = index % 5 == 0 ? null : tasks[index % tasks.Length];
             return new WorkSpan(Guid.NewGuid(), time, time.AddSeconds(8),
-                new CaptureSource(index % 2 == 0 ? "VS Code" : "Browser", task));
+                new CaptureSource(index % 2 == 0 ? "VS Code" : "Browser", task, Context: $"Window title {index % 40}"));
         }).ToArray();
         var timer = Stopwatch.StartNew();
         store.SaveCapture(spans[..1000], [], zone);

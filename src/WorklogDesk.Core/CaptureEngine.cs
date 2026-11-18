@@ -84,7 +84,14 @@ public sealed class CaptureEngine
                     new CaptureSource("Idle gap", Kind: SpanKind.Idle)));
         }
 
-        if (open?.Source != source)
+        if (open != null && source != null && open.Source.SameAttribution(source))
+        {
+            // Same app and task under a new title: keep one span and remember what else was open.
+            var context = WindowContext.Append(open.Source.Context, source.Context);
+            if (context != open.Source.Context)
+                open = open with { Source = open.Source with { Context = context } };
+        }
+        else if (open?.Source != source)
         {
             Close(next.Tick, next.Utc);
             if (source != null)

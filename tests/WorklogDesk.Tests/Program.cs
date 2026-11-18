@@ -42,6 +42,10 @@ var checks = new (string Title, Action Check)[]
     ("a brief switch into a client-only mapped window is incidental", MappedGlance),
     ("oldest unassigned ignores days with only idle gaps", UnreviewedSkipsIdle),
     ("shortening or moving a row keeps the trimmed time unassigned", EditKeepsRemainders),
+    ("window titles yield Jira keys, summaries and readable context", TitleDetection),
+    ("a title change within one task extends context without splitting the span", ContextWithoutSplit),
+    ("unassigned gaps take the nearest detected issue as a suggestion", GapSuggestions),
+    ("window context is stored encrypted and purged after retention", ContextStorage),
     ("scoped Jira authentication is confined to the gateway", JiraScoped),
     ("project search includes colleague issues and pins continuation", JiraSearch),
     ("Jira rejects redirects and untrusted sites", JiraRejectsRedirect)
@@ -342,6 +346,89 @@ static void LedgerOrphan()
     Equal("one", ManualLedger.Orphaned(RoundingMode.IssueDay, logs, [entry]).Single().Id);
 }
 
+static void TitleDetection()
+{
+    Equal("BC-123", WindowContext.DetectIssue("[BC-123] Restore failed on SQL - Jira - Work - Microsoft​ Edge"));
+    Equal("OPS-7", WindowContext.DetectIssue("feature/OPS-7-upgrade - bc-devops - Visual Studio Code"));
+    Equal("BC-9", WindowContext.DetectIssue("RE: BC-9 Licence renewal - Message (HTML)"));
+    Equal(null, WindowContext.DetectIssue("UTF-8 vs SHA-256 notes - Microsoft Edge"));
+    Equal(null, WindowContext.DetectIssue("Compare BC-1 and BC-2 - Jira"));
+    Equal("BC-1", WindowContext.DetectIssue("BC-1 and BC-1 again"));
+    Equal(null, WindowContext.DetectIssue("SRV-12 maintenance", new HashSet<string> { "BC" }));
+    Equal("BC-12", WindowContext.DetectIssue("SRV-12 and BC-12", new HashSet<string> { "BC" }));
+    Equal(null, WindowContext.DetectIssue("x86_64 build ab-12 report"));
+    var context = WindowContext.Normalize("(3) [BC-123] Restore failed on SQL - Jira - Microsoft Edge");
+    Equal("[BC-123] Restore failed on SQL", context);
+    Equal("Restore failed on SQL", WindowContext.JiraSummary(context, "BC-123"));
+    Equal("", WindowContext.JiraSummary("Inbox", "BC-123"));
+    Equal("CONTOSO-BC01", WindowContext.Normalize("CONTOSO-BC01 - Remote Desktop Connection"));
+    True(WindowContext.Normalize(new string('a', 400)).Length <= WindowContext.MaxLength);
+    Equal("a · b · c", WindowContext.Append(WindowContext.Append(WindowContext.Append("", "a"), "b"), "c"));
+    Equal("a · b · c", WindowContext.Append("a · b · c", "d"));
+    Equal("a · b", WindowContext.Append("a · b", "a"));
+}
+
+static void ContextWithoutSplit()
+{
+    var engine = new CaptureEngine();
+    var first = new CaptureSource("Browser", Context: "Inbox");
+    Observe(engine, 0, 0, first);
+    Observe(engine, 5_000, 5_000, first with { Context = "Release notes" });
+    Observe(engine, 9_000, 9_000, first with { Context = "Inbox" });
+    Observe(engine, 20_000, 20_000, new CaptureSource("Browser", new TaskLabel("", "BC-5"), Context: "[BC-5] Fix"));
+    Observe(engine, 30_000, 30_000, null);
+    var spans = engine.Ready.Where(span => span.Source.Kind == SpanKind.Foreground).OrderBy(span => span.Start).ToArray();
+    Equal(2, spans.Length);
+    Equal("Inbox · Release notes", spans[0].Source.Context);
+    Equal(20d, (spans[0].End - spans[0].Start).TotalSeconds);
+    Equal("BC-5", spans[1].Source.Task!.Issue);
+    var row = Timeline.Allocate(spans[0], TimeZoneInfo.Utc).Single();
+    Equal("Inbox · Release notes", row.Context);
+}
+
+static void GapSuggestions()
+{
+    var jira = Row(0, 300, "BC-5") with { Task = new TaskLabel("Contoso", "BC-5", "Restore") };
+    var rdp = Row(300, 1500, "") with { App = "Remote Desktop", Task = new TaskLabel("Contoso") };
+    var code = Row(1500, 2100, "") with { Task = new TaskLabel() };
+    var otherClient = Row(2100, 2400, "") with { Task = new TaskLabel("Fabrikam") };
+    var idle = Row(2400, 2700, "") with { Kind = SpanKind.Idle };
+    var far = Row(9000, 9300, "") with { Task = new TaskLabel() };
+    var later = Row(10000, 10300, "OPS-2");
+    var suggestions = Timeline.Suggest([jira, rdp, code, otherClient, idle, far, later]);
+    Equal("BC-5", suggestions[rdp.Id].Issue);
+    Equal("Restore", suggestions[rdp.Id].Description);
+    Equal("BC-5", suggestions[code.Id].Issue);
+    True(!suggestions.ContainsKey(otherClient.Id));
+    True(!suggestions.ContainsKey(idle.Id));
+    Equal("OPS-2", suggestions[far.Id].Issue);
+    True(!suggestions.ContainsKey(jira.Id));
+    Equal(0, Timeline.Suggest([code, far]).Count);
+}
+
+static void ContextStorage() => WithStore(folder =>
+{
+    var today = DateOnly.FromDateTime(DateTime.UtcNow);
+    var start = Timeline.DayStart(today, TimeZoneInfo.Utc).AddHours(1);
+    var span = new WorkSpan(Guid.NewGuid(), start, start.AddMinutes(5),
+        new CaptureSource("Remote Desktop", Context: "CONTOSO-SECRET-HOST"));
+    using (var db = new WorkStore(folder))
+    {
+        db.SaveCapture([span], [], TimeZoneInfo.Utc);
+        Equal("CONTOSO-SECRET-HOST", db.Rows(today).Single().Context);
+    }
+    var bytes = File.ReadAllBytes(Path.Combine(folder, "worklog.db"));
+    var wal = Path.Combine(folder, "worklog.db-wal");
+    var all = File.Exists(wal) ? bytes.Concat(File.ReadAllBytes(wal)).ToArray() : bytes;
+    True(System.Text.Encoding.UTF8.GetString(all).IndexOf("CONTOSO-SECRET-HOST", StringComparison.Ordinal) < 0);
+    using var reopened = new WorkStore(folder);
+    Equal("CONTOSO-SECRET-HOST", reopened.Rows(today).Single().Context);
+    reopened.PurgeContext(today.AddDays(1));
+    var row = reopened.Rows(today).Single();
+    Equal("", row.Context);
+    Equal("Remote Desktop", row.App);
+});
+
 static void EditKeepsRemainders()
 {
     var original = Row(0, 1800, "BC-5") with { Approved = true };
@@ -585,6 +672,33 @@ static void NativeApproval() => WithStore(folder =>
                 var tabs = Descendants(window).OfType<TabControl>().Single();
                 var activity = Descendants(window).OfType<DataGridView>().Single(grid => grid.AccessibleName == "Daily activity");
                 var approve = Descendants(window).OfType<Button>().Single(action => action.Text == "Approve");
+                // Several selected rows, including ones with uncertain timing, are all assigned, and Ctrl+Z restores them.
+                var loose = store.Rows(app.Today).Where(row => row.Status == Disposition.Unassigned &&
+                    row.Kind is SpanKind.Foreground or SpanKind.Uncertain).ToArray();
+                var uncertainStart = Timeline.DayStart(app.Today, app.Zone).AddHours(20);
+                var uncertain = new Allocation(Guid.NewGuid().ToString("N"), app.Today, uncertainStart, uncertainStart.AddMinutes(4),
+                    "VS Code", SpanKind.Uncertain, Disposition.Unassigned, new TaskLabel());
+                store.ReplaceRows([], [uncertain]);
+                window.Reload();
+                var targets = loose.Select(row => row.Id).Append(uncertain.Id).ToHashSet();
+                activity.ClearSelection();
+                foreach (DataGridViewRow gridRow in activity.Rows)
+                    if (window.ActivityAt(gridRow.Index).Any(row => targets.Contains(row.Id)))
+                        gridRow.Selected = true;
+                window.AssignOverride = _ => (new TaskLabel("Client", "ZZ-1", "Bulk"), Disposition.Billable);
+                window.AssignSelected();
+                window.AssignOverride = null;
+                True(store.Rows(app.Today).Where(row => targets.Contains(row.Id)).All(row => row.Task.Issue == "ZZ-1"));
+                window.Undo();
+                True(store.Rows(app.Today).Where(row => targets.Contains(row.Id)).All(row => row.Task.Issue != "ZZ-1"));
+                var suggestedBefore = store.Rows(app.Today).Count(row => row.Status == Disposition.Billable);
+                window.AcceptSuggestions();
+                True(store.Rows(app.Today).Count(row => row.Status == Disposition.Billable) > suggestedBefore);
+                window.Undo();
+                Equal(suggestedBefore, store.Rows(app.Today).Count(row => row.Status == Disposition.Billable));
+                store.ReplaceRows([uncertain.Id], []);
+                window.Reload();
+                activity.ClearSelection();
                 activity.ClearSelection();
                 activity.CurrentCell = activity.Rows[0].Cells[0];
                 activity.Rows[0].Selected = true;
@@ -644,8 +758,8 @@ static void NativeApproval() => WithStore(folder =>
                 }
                 Equal("old", File.ReadAllText(protectedFile));
                 Equal(0, store.Exports(app.Today).Length);
-                var copy = Descendants(window).OfType<Button>().Single(action => action.Text == "Copy worklog");
-                var mark = Descendants(window).OfType<Button>().Single(action => action.Text == "Mark entered in Tempo");
+                var copy = Descendants(window).OfType<Button>().Single(action => action.Text == "Copy for Tempo");
+                var mark = Descendants(window).OfType<Button>().Single(action => action.Text == "Mark entered");
                 void SelectLine()
                 {
                     worklogs.ClearSelection();
