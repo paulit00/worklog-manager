@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/WorklogDesk.Core/WorklogDesk.Core.csproj" />
+    <Project Path="src/WorklogDesk.Windows/WorklogDesk.Windows.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/WorklogDesk.Tests/WorklogDesk.Tests.csproj" />
+  </Folder>
+</Solution>
