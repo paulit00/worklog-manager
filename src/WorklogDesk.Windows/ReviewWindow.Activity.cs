@@ -34,7 +34,7 @@ internal sealed partial class ReviewWindow
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     internal Func<TaskLabel, (TaskLabel, Disposition)?>? AssignOverride { get; set; }
 
-    internal void AssignSelected()
+    internal void AssignSelected(string? issue = null)
     {
         var selected = Selected();
         if (selected.Length == 0)
@@ -45,7 +45,7 @@ internal sealed partial class ReviewWindow
         var clients = selected.Select(row => row.Task.Client).Where(value => value.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         var issues = selected.Select(row => row.Task.Issue).Where(value => value.Length > 0).Distinct().ToArray();
         var descriptions = selected.Select(row => row.Task.Description).Where(value => value.Length > 0).Distinct().ToArray();
-        var initial = new TaskLabel(clients.Length == 1 ? clients[0] : "", issues.Length == 1 ? issues[0] : "",
+        var initial = new TaskLabel(clients.Length == 1 ? clients[0] : "", issue ?? (issues.Length == 1 ? issues[0] : ""),
             descriptions.Length == 1 ? descriptions[0] : "");
         var caption = $"Assign {selected.Length} row(s) · {Duration(selected.Sum(row => row.Milliseconds))}";
         TaskLabel task;
@@ -127,43 +127,69 @@ internal sealed partial class ReviewWindow
         Notify($"Assigned {targets.Length} row(s), {minutes}, to their suggested issues. Ctrl+Z undoes it.");
     }
 
+    private ReconstructDayDialog? reconstruct;
+
+    /// <summary>Opens "Reconstruct my day" for the shown date. It stays open beside the review; date navigation is locked meanwhile.</summary>
     private void OpenAssistedReview()
     {
         if (TempoBusy)
             return;
-        var date = Day;
-        using var dialog = new AssistedReviewDialog(app, date, store.Rows(date), assignments =>
+        if (reconstruct is { IsDisposed: false })
         {
-            var original = assignments.SelectMany(item => item.Group.Rows).ToArray();
-            var changes = assignments.SelectMany(item => item.Group.Rows.Select(row => row with
-            {
-                Status = Disposition.Billable,
-                Task = row.Task with
-                {
-                    Issue = item.Task.Issue,
-                    Client = row.Task.Client.Length > 0 ? row.Task.Client : item.Task.Client,
-                    Description = row.Task.Description.Length > 0 ? row.Task.Description : item.Task.Description
-                }
-            })).ToArray();
-            return SaveAssisted(date, original, changes);
-        });
-        dialog.ShowDialog(this);
+            reconstruct.Activate();
+            return;
+        }
+        reconstruct = new ReconstructDayDialog(app, store, this, Day);
+        reconstruct.FormClosed += (_, _) =>
+        {
+            reconstruct = null;
+            LockNavigation(false);
+        };
+        LockNavigation(true);
+        reconstruct.Show(this);
     }
 
-    private string? SaveAssisted(DateOnly date, Allocation[] original, Allocation[] changes)
+    RoundingMode IReconstructHost.Mode => Mode;
+
+    string? IReconstructHost.ApplyAssisted(DateOnly date, Allocation[] expected, Allocation[] changes, SegmentGuard[] guards,
+        Func<IReadOnlyList<Allocation>, string?> verify)
     {
         if (date != Day || TempoBusy)
-            return "The reviewed date or Tempo operation changed. Open Suggestions again.";
+            return "The reviewed date or Tempo operation changed. Close and reopen Reconstruct my day.";
         try
         {
-            store.ReplaceRows([], changes, original);
-            undo.Push(new UndoStep(date, [], original, "suggested assignments", changes));
+            store.ReplaceRows([], changes, expected, guards, verify);
+            undo.Push(new UndoStep(date, [], expected, "suggested assignments", changes));
             undoButton.Enabled = true;
             Reload();
             return null;
         }
         catch (InvalidOperationException error) { return error.Message; }
         catch (Microsoft.Data.Sqlite.SqliteException) { return "Local storage could not save the assignment. Try again."; }
+    }
+
+    void IReconstructHost.OpenInActivity(DateOnly date, IReadOnlyCollection<string> rowIds, string? issue)
+    {
+        if (date != Day)
+            return;
+        Activate();
+        tabs.SelectedIndex = 0;
+        var ids = rowIds.ToHashSet(StringComparer.Ordinal);
+        activity.ClearSelection();
+        DataGridViewRow? first = null;
+        for (var index = 0; index < visibleActivity.Length && index < activity.Rows.Count; index++)
+            if (visibleActivity[index].Any(row => ids.Contains(row.Id)))
+            {
+                activity.Rows[index].Selected = true;
+                first ??= activity.Rows[index];
+            }
+        if (first == null)
+        {
+            Notify("Those rows aren't visible. Clear the Activity filter and try again.");
+            return;
+        }
+        activity.FirstDisplayedScrollingRowIndex = first.Index;
+        AssignSelected(issue);
     }
 
     private void ClassifySelected(Disposition disposition, Allocation[]? rowsToChange = null)

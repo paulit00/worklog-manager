@@ -27,7 +27,7 @@ public static partial class WindowContext
     /// <summary>Removes unread counters and the application name so the title reads as what was open.</summary>
     public static string Normalize(string title)
     {
-        var text = UnreadCounter().Replace(title.Trim(), "");
+        var text = MorePages().Replace(UnreadCounter().Replace(title.Trim(), ""), "");
         var parts = text.Split([" - ", " — ", " | "], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList();
         while (parts.Count > 1 && AppSuffixes.Contains(parts[^1], StringComparer.OrdinalIgnoreCase))
             parts.RemoveAt(parts.Count - 1);
@@ -36,6 +36,30 @@ public static partial class WindowContext
             parts.RemoveAt(parts.Count - 1);
         var result = string.Join(" - ", parts);
         return result.Length <= MaxLength ? result : result[..(MaxLength - 1)] + "…";
+    }
+
+    private static readonly string[] BrowserNames = ["Microsoft Edge", "Microsoft​ Edge", "Google Chrome", "Mozilla Firefox", "Brave"];
+
+    /// <summary>
+    /// Names the web app behind a raw browser title, "Outlook web" or "Teams web", or null. The browser name, the
+    /// Edge profile and the "and N more pages" tab counter are removed first, so "Subject - Jane - Outlook - Work -
+    /// Microsoft Edge" is recognised.
+    /// </summary>
+    public static string? WebApp(string rawTitle)
+    {
+        var text = MorePages().Replace(rawTitle.Trim(), "");
+        var parts = text.Split([" - ", " — ", " | "], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList();
+        while (parts.Count > 1 && BrowserNames.Contains(parts[^1], StringComparer.OrdinalIgnoreCase))
+            parts.RemoveAt(parts.Count - 1);
+        // The profile name, when present, sits between the app name and the browser name.
+        foreach (var part in parts.Skip(1).TakeLast(2))
+        {
+            if (part.Equals("Outlook", StringComparison.OrdinalIgnoreCase) || part.StartsWith("Outlook (", StringComparison.OrdinalIgnoreCase))
+                return "Outlook web";
+            if (part.Equals("Microsoft Teams", StringComparison.OrdinalIgnoreCase) || part.Equals("Teams", StringComparison.OrdinalIgnoreCase))
+                return "Teams web";
+        }
+        return null;
     }
 
     /// <summary>
@@ -88,6 +112,10 @@ public static partial class WindowContext
 
     [GeneratedRegex(@"\A\(\d+\)\s*", RegexOptions.CultureInvariant)]
     private static partial Regex UnreadCounter();
+
+    // Edge appends "and 3 more pages" (or tabs) to the active tab's title in a window with several tabs.
+    [GeneratedRegex(@"\s+and \d+ more (?:pages?|tabs?)(?=\s+[-—|]\s+|\z)", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
+    private static partial Regex MorePages();
 
     [GeneratedRegex(@"(?<![A-Za-z0-9_-])([A-Z][A-Z0-9]{1,9})-([1-9][0-9]{0,6})(?![A-Za-z0-9_])", RegexOptions.CultureInvariant)]
     private static partial Regex IssueKey();

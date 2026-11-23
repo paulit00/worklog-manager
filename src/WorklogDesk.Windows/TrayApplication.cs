@@ -40,10 +40,14 @@ internal sealed partial class TrayApplication : ApplicationContext
     {
         this.demo = demo;
         this.syntheticIdle = syntheticIdle;
+        DataFolder = folder;
         store = new WorkStore(folder, inMemory: demo);
         Settings = store.Preferences();
         Palette.Apply(Settings.Theme);
         Zone = TimeZoneInfo.FindSystemTimeZoneById(Settings.TimeZoneId);
+        // Browser rows captured before this moment carry no Outlook-web or Teams-web label.
+        if (Settings.MailLabelCutoff == null)
+            Settings = Settings with { MailLabelCutoff = DateTimeOffset.UtcNow };
         store.SavePreferences(Settings);
         interruptedManual = store.Recover(Zone);
         store.ExpireSource(DateTimeOffset.UtcNow);
@@ -332,6 +336,12 @@ internal sealed partial class TrayApplication : ApplicationContext
 
     public void SaveRounding(RoundingMode mode) => SaveSettings(Settings with { Rounding = mode });
 
+    /// <summary>Saves day-reconstruction preferences (provider, model, title families, Outlook app, notice).</summary>
+    internal void SaveAssisted(Func<Preferences, Preferences> change) => SaveSettings(change(Settings));
+
+    /// <summary>The data folder for local files such as the AI diagnostics log and the Outlook token cache.</summary>
+    internal string DataFolder { get; private set; } = "";
+
     private void SaveSettings(Preferences settings)
     {
         if (settings.Rounding != Settings.Rounding)
@@ -384,8 +394,23 @@ internal sealed partial class TrayApplication : ApplicationContext
         return new JiraCatalog(config, token);
     }
 
+    private bool exited;
+
+    /// <summary>Disposed without exiting the message loop (hosted in tests): still release the database file.</summary>
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && !exited)
+        {
+            tick.Stop();
+            listenerCancellation.Cancel();
+            store.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+
     protected override void ExitThreadCore()
     {
+        exited = true;
         tick.Stop();
         StopCompletion();
         listenerCancellation.Cancel();

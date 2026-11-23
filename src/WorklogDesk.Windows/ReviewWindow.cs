@@ -2,7 +2,7 @@ using WorklogDesk.Core;
 
 namespace WorklogDesk.Windows;
 
-internal sealed partial class ReviewWindow : Form
+internal sealed partial class ReviewWindow : Form, IReconstructHost
 {
     private readonly TrayApplication app;
     private readonly WorkStore store;
@@ -53,7 +53,21 @@ internal sealed partial class ReviewWindow : Form
     private RoundingMode Mode => rounding.SelectedIndex == 1 ? RoundingMode.Session : RoundingMode.IssueDay;
     private DateOnly Day => DateOnly.FromDateTime(date.Value);
     internal DateOnly SelectedDay => Day;
-    internal bool CanNavigateCompletion => !TempoBusy && (!IsHandleCreated || IsWindowEnabled(Handle));
+    internal bool CanNavigateCompletion => !TempoBusy && !navigationLocked && (!IsHandleCreated || IsWindowEnabled(Handle));
+    private bool navigationLocked;
+    private readonly List<Control> navigationControls = [];
+
+    /// <summary>While Reconstruct my day is open, the shown date stays fixed so its accepts and undo steps match.</summary>
+    private void LockNavigation(bool locked)
+    {
+        navigationLocked = locked;
+        foreach (var control in navigationControls)
+            control.Enabled = !locked;
+        if (locked)
+            Notify("Close Reconstruct my day to change the date.");
+        else
+            app.ResumeCompletionNavigation();
+    }
     internal bool IsShown => IsHandleCreated && IsWindowVisible(Handle);
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -140,9 +154,10 @@ internal sealed partial class ReviewWindow : Form
             undoButton.Enabled = false;
             Reload();
         };
-        navigation.Controls.AddRange([previous, dateButton, date, next,
-            Ui.Button("Today", (_, _) => ChangeDay(app.Today), 69),
-            Ui.Button("Oldest unassigned", (_, _) => GoToUnreviewed(), 142)]);
+        var today = Ui.Button("Today", (_, _) => ChangeDay(app.Today), 69);
+        var oldest = Ui.Button("Oldest unassigned", (_, _) => GoToUnreviewed(), 142);
+        navigation.Controls.AddRange([previous, dateButton, date, next, today, oldest]);
+        navigationControls.AddRange([previous, dateButton, next, today, oldest]);
         shell.Controls.Add(navigation, 0, 1);
 
         var totals = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 3, AutoSize = true, Margin = new Padding(2, 8, 2, 8) };
@@ -159,7 +174,7 @@ internal sealed partial class ReviewWindow : Form
         var viewBar = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 0, 18, 0) };
         viewBar.Controls.AddRange(views);
         var assign = Ui.Button("Assign…", (_, _) => AssignSelected(), 96);
-        var assisted = Ui.Button("AI suggestions…", (_, _) => OpenAssistedReview(), 130);
+        var assisted = Ui.Button("Reconstruct my day…", (_, _) => OpenAssistedReview(), 150);
         Ui.Primary(assign);
         Ui.Primary(acceptSuggestions);
         var approve = Ui.Button("Approve", (_, _) => ApproveSelected(), 89);
@@ -541,7 +556,7 @@ internal sealed partial class ReviewWindow : Form
 
     private void ChangeDay(DateOnly day)
     {
-        if (!TempoBusy && day >= DateOnly.FromDateTime(date.MinDate) && day <= DateOnly.FromDateTime(date.MaxDate))
+        if (!TempoBusy && !navigationLocked && day >= DateOnly.FromDateTime(date.MinDate) && day <= DateOnly.FromDateTime(date.MaxDate))
             date.Value = day.ToDateTime(TimeOnly.MinValue);
     }
 

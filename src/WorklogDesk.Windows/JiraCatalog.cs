@@ -48,6 +48,7 @@ internal sealed record JiraSettings(string Site, string Email, string CloudId, s
 }
 
 internal sealed record JiraIssue(string Key, string Summary, string Status);
+internal sealed record JiraCandidateResult(JiraCandidate[] Candidates, string? Warning);
 internal sealed record JiraResults(IReadOnlyList<JiraIssue> Issues, string? Next);
 internal sealed record JiraQuery(string Text, bool Mine, bool WaitingOnly, string? Next = null);
 internal sealed record JiraProject(string Key, string Name);
@@ -293,6 +294,79 @@ internal sealed class JiraCatalog : IDisposable
         return new JiraResults(root.GetProperty("issues").EnumerateArray().Select(ParseIssue)
             .Where(issue => TaskLabel.ValidIssue(issue.Key) && projects.Contains(issue.Key[..issue.Key.LastIndexOf('-')], StringComparer.Ordinal))
             .Take(20).ToArray(), root.TryGetProperty("nextPageToken", out var next) ? next.GetString() : null);
+    }
+
+    /// <summary>
+    /// Automatic candidates for day reconstruction, limited to the configured projects: the user's recent issues
+    /// (assigned, reported, watched, logged or recently viewed) plus the given keys. Only keys and JQL operators are
+    /// sent; window text never is. Returns an empty list when no projects are configured.
+    /// </summary>
+    public async Task<JiraCandidateResult> CandidatesAsync(IReadOnlyCollection<string> keys, CancellationToken cancel)
+    {
+        var projects = JiraSettings.ProjectKeys(config.Projects);
+        if (projects.Length == 0)
+            return new([], null);
+        string? warning = null;
+        bool Configured(string key) => TaskLabel.ValidIssue(key) && projects.Contains(key[..key.LastIndexOf('-')], StringComparer.Ordinal);
+        var filter = "project in (" + string.Join(",", projects.Select(Quote)) + ")";
+        var found = new List<JiraCandidate>();
+        foreach (var people in new[]
+                 {
+                     "assignee = currentUser() OR reporter = currentUser() OR watcher = currentUser() OR worklogAuthor = currentUser() OR issue in issueHistory()",
+                     // Some sites restrict watcher and history functions; retry without them.
+                     "assignee = currentUser() OR reporter = currentUser() OR worklogAuthor = currentUser()"
+                 })
+        {
+            try
+            {
+                using var response = await Read("rest/api/3/search/jql?fields=summary,status,project,parent&maxResults=50&jql=" +
+                    Uri.EscapeDataString($"{filter} AND ({people}) AND updated >= -30d ORDER BY updated DESC"), cancel).ConfigureAwait(false);
+                found.AddRange(response.RootElement.GetProperty("issues").EnumerateArray().Select(ParseCandidate));
+                warning = null;
+                break;
+            }
+            catch (InvalidOperationException error) when (error.Message.Contains("HTTP 400", StringComparison.Ordinal))
+            {
+                warning = "Jira refused the recent-issues search.";
+            }
+            catch (Exception error) when (error is InvalidOperationException or HttpRequestException or JsonException or
+                KeyNotFoundException or InvalidDataException || error is TaskCanceledException && !cancel.IsCancellationRequested)
+            {
+                // Degrade: today's anchors and typed search still work.
+                warning = "Jira's recent issues couldn't be read (" + (error is InvalidOperationException ? error.Message.TrimEnd('.') : "network or unreadable reply") + ").";
+                break;
+            }
+        }
+        var wanted = keys.Where(Configured).Distinct(StringComparer.Ordinal).Take(40).ToArray();
+        if (wanted.Length > 0)
+        {
+            try
+            {
+                using var response = await Send(HttpMethod.Post, "rest/api/3/issue/bulkfetch",
+                    new { issueIdsOrKeys = wanted, fields = new[] { "summary", "status", "project", "parent" } }, cancel).ConfigureAwait(false);
+                // Unknown or invisible keys come back in issueErrors and are simply dropped.
+                if (response.RootElement.TryGetProperty("issues", out var issues) && issues.ValueKind == JsonValueKind.Array)
+                    found.AddRange(issues.EnumerateArray().Select(ParseCandidate));
+            }
+            catch (Exception error) when (error is InvalidOperationException or HttpRequestException or JsonException or
+                KeyNotFoundException or InvalidDataException || error is TaskCanceledException && !cancel.IsCancellationRequested)
+            {
+                warning ??= "Some Jira keys from window titles couldn't be looked up.";
+            }
+        }
+        return new(found.Where(candidate => Configured(candidate.Key)).DistinctBy(candidate => candidate.Key).Take(70).ToArray(), warning);
+    }
+
+    private static JiraCandidate ParseCandidate(JsonElement item)
+    {
+        var issue = ParseIssue(item);
+        var fields = item.GetProperty("fields");
+        var project = fields.TryGetProperty("project", out var p) && p.ValueKind == JsonValueKind.Object &&
+            p.TryGetProperty("name", out var name) ? name.GetString() ?? "" : "";
+        var parent = fields.TryGetProperty("parent", out var up) && up.ValueKind == JsonValueKind.Object &&
+            up.TryGetProperty("fields", out var parentFields) && parentFields.TryGetProperty("summary", out var summary)
+            ? summary.GetString() ?? "" : "";
+        return new JiraCandidate(issue.Key, issue.Summary, issue.Status, project, parent);
     }
 
     public void Dispose() => client.Dispose();

@@ -264,6 +264,10 @@ internal sealed class WindowsObserver : NativeWindow, IDisposable
         }
         if (family is "Outlook" or "Teams")
             return new CaptureSource(family, mapped, Context: context);
+        // Mail and chat in a browser tab are labelled so their titles follow the mail and Teams privacy rules.
+        // Mappings and pinning above still saw the plain "Browser" family; like desktop Outlook and Teams, these are never pinned.
+        if (family == "Browser" && WindowContext.WebApp(raw) is { } web)
+            return new CaptureSource("Browser · " + web, mapped, Context: context);
         var pinned = Pin?.Invoke(mapped);
         if (mapped != null && pinned != null && Conflicts(mapped, pinned))
         {

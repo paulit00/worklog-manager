@@ -66,13 +66,21 @@ var checks = new (string Title, Action Check)[]
     ("project search includes colleague issues and pins continuation", JiraSearch),
     ("Jira rejects redirects and untrusted sites", JiraRejectsRedirect),
     ("assisted edits refuse stale snapshots and timing changes, and undo cleanly", AssistedTests.StaleAssignment),
-    ("assisted edits cannot touch copied or entered time", AssistedTests.ProtectedTime),
-    ("malformed or out-of-scope AI responses are rejected without crashing", AssistedTests.MalformedResponses),
-    ("Claude requests use structured output, fallbacks and Anthropic headers, and handle refusals", AssistedTests.ClaudeProvider),
-    ("AI requests omit window text and subjects unless opted in, and redact links and keys", AssistedTests.RequestPrivacy),
+    ("assisted edits cannot touch copied or entered time, and a stale key blocks the day", AssistedTests.ProtectedTime),
+    ("segment guards accept capture after the horizon and refuse changes inside it or changed totals", AssistedTests.SegmentGuards),
+    ("the redactor keeps keys, dates and versions and removes contacts, links and secrets", AssistedTests.Redaction),
+    ("title rules hold back mail, older browser titles, opted-out families and non-work states", AssistedTests.TitleRules),
+    ("episodes follow state precedence, bridge brief switches, merge by token and conserve time", AssistedTests.Episodes),
+    ("the day's facts send only allowed titles and build Claude and OpenAI requests", AssistedTests.Facts),
+    ("AI plans fail closed on structure and mark only rule-breaking segments invalid", AssistedTests.Validation),
+    ("applying keeps stale descriptions out, flags clients and computes Tempo effects in both modes", AssistedTests.Applying),
+    ("history hints use only approved or entered work, today's tokens and the family opt-outs", AssistedTests.History),
+    ("Jira candidates stay in configured projects, retry without watcher and bulk-fetch title keys", AssistedTests.JiraCandidates),
+    ("Outlook calendar skips declined, cancelled, free and all-day events and hides private subjects", AssistedTests.Calendar),
     ("Outlook Sent Items paging is bounded and stays on Graph", AssistedTests.OutlookPaging),
-    ("only Teams message links over HTTPS are accepted", AssistedTests.TeamsLinks),
-    ("the MCP executable serves one read-only tool over redirected stdio", AssistedTests.McpOverStdio)
+    ("the AI transport reports usage and turns refusals, truncation and errors into readable messages", AssistedTests.AiTransport),
+    ("the MCP executable serves two read-only tools that follow the title rules", AssistedTests.McpOverStdio),
+    ("the reconstruction window fills its episode list without a refresh loop and honours unticks", AssistedTests.DialogRefresh)
 };
 var failures = 0;
 foreach (var (title, check) in checks)

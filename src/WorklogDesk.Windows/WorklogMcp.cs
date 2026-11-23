@@ -15,60 +15,35 @@ namespace WorklogDesk.Windows;
 internal sealed record McpActivity(string Id, DateTimeOffset Start, DateTimeOffset End, long RecordedMilliseconds,
     string Source, string Kind, string? WindowContext);
 
-internal sealed record McpActivitySnapshot(DateOnly Date, McpActivity[] Rows, bool Truncated)
+internal sealed record McpActivitySnapshot(DateOnly Date, McpActivity[] Rows, bool Truncated, string Episodes)
 {
     public static McpActivitySnapshot Read(string folder, DateOnly date, bool context)
     {
-        var path = Path.Combine(folder, "worklog.db");
-        if (!File.Exists(path))
-            throw new InvalidOperationException("No Worklog Desk database was found.");
-        using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
-        {
-            DataSource = path, Mode = SqliteOpenMode.ReadOnly, Pooling = false, DefaultTimeout = 2
-        }.ToString());
-        connection.Open();
-        using var transaction = connection.BeginTransaction(deferred: true);
-        using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = "PRAGMA user_version";
-        if (command.ExecuteScalar() is not 5L)
+        using var store = WorkStore.OpenReadOnly(folder);
+        if (store.DiskVersion() != 5)
             throw new InvalidOperationException("This interface requires Worklog Desk database version 5.");
-        command.CommandText = context ? """
-            SELECT a.started,a.ended,a.app,a.kind,c.payload FROM allocation a
-            LEFT JOIN context c ON a.context_id=c.id
-            WHERE a.day=$date AND a.status=$unassigned AND a.approved=0 AND a.kind IN ($foreground,$manual,$uncertain)
-            ORDER BY a.started,a.id LIMIT 1001
-            """ : """
-            SELECT a.started,a.ended,a.app,a.kind,NULL FROM allocation a
-            WHERE a.day=$date AND a.status=$unassigned AND a.approved=0 AND a.kind IN ($foreground,$manual,$uncertain)
-            ORDER BY a.started,a.id LIMIT 1001
-            """;
-        command.Parameters.AddWithValue("$date", date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
-        command.Parameters.AddWithValue("$unassigned", (int)Disposition.Unassigned);
-        command.Parameters.AddWithValue("$foreground", (int)SpanKind.Foreground);
-        command.Parameters.AddWithValue("$manual", (int)SpanKind.Manual);
-        command.Parameters.AddWithValue("$uncertain", (int)SpanKind.Uncertain);
+        var preferences = store.Preferences();
+        var zone = TimeZoneInfo.FindSystemTimeZoneById(preferences.TimeZoneId);
+        // The same title rules as an AI request, without a Microsoft account: older browser titles are always held back.
+        var policy = context
+            ? new TitlePolicy(true, (preferences.AssistedTitlesOff ?? []).ToHashSet(StringComparer.Ordinal), false, false,
+                preferences.MailLabelCutoff, null, null, new HashSet<string>())
+            : TitlePolicy.Off;
+        var all = store.Rows(date);
         var rows = new List<McpActivity>();
-        using var reader = command.ExecuteReader();
-        while (reader.Read())
+        var unresolved = all.Where(row => row.Status == Disposition.Unassigned && !row.Approved &&
+            row.Kind is SpanKind.Foreground or SpanKind.Manual or SpanKind.Uncertain).ToArray();
+        foreach (var row in unresolved.Take(1_000))
         {
-            if (rows.Count == 1_000)
-                return new(date, rows.ToArray(), true);
-            var start = new DateTimeOffset(reader.GetInt64(0), TimeSpan.Zero);
-            var end = new DateTimeOffset(reader.GetInt64(1), TimeSpan.Zero);
-            var source = AssistedEvidence.AppFamily(reader.GetString(2));
-            var windowContext = context && source != "Outlook" && !reader.IsDBNull(4) ? Decode((byte[])reader[4]) : null;
-            rows.Add(new($"row-{rows.Count + 1}", start, end, (long)(end - start).TotalMilliseconds,
-                source, ((SpanKind)reader.GetInt32(3)).ToString(), windowContext));
+            var titles = AssistedEvidence.Titles(row.Context).Where(title => DayEpisodes.Decide(row, title, policy) == TitleDecision.Sent)
+                .Select(title => AssistedEvidence.Redact(title, 160)).ToArray();
+            rows.Add(new($"row-{rows.Count + 1}", row.Start, row.End, row.Milliseconds, AssistedEvidence.AppFamily(row.App),
+                row.Kind.ToString(), titles.Length == 0 ? null : string.Join(" · ", titles)));
         }
-        return new(date, rows.ToArray(), false);
-
-        static string Decode(byte[] payload)
-        {
-            var clear = ProtectedData.Unprotect(payload, null, DataProtectionScope.CurrentUser);
-            try { return AssistedEvidence.Text(JsonSerializer.Deserialize<string>(clear) ?? "", 160); }
-            finally { CryptographicOperations.ZeroMemory(clear); }
-        }
+        string facts;
+        try { facts = DayReconstruction.Facts(date, zone, DayEpisodes.Build(all, Timeline.DayStart(date, zone)), policy, [], [], [], []); }
+        catch (InvalidOperationException error) { facts = JsonSerializer.Serialize(new { error = error.Message }); }
+        return new(date, rows.ToArray(), unresolved.Length > 1_000, facts);
     }
 }
 
@@ -96,7 +71,8 @@ internal static class WorklogMcp
             Console.Error.WriteLine("Could not read the Worklog Desk database. Open Worklog Desk to make its WAL index available, then relaunch this interface.");
             return 1;
         }
-        catch (Exception error) when (error is InvalidOperationException or CryptographicException or JsonException or IOException or UnauthorizedAccessException)
+        catch (Exception error) when (error is InvalidOperationException or CryptographicException or JsonException or IOException or
+            UnauthorizedAccessException or TimeZoneNotFoundException)
         {
             Console.Error.WriteLine("Could not open the selected Worklog Desk snapshot. Verify the data folder and database version.");
             return 1;
@@ -130,6 +106,10 @@ internal static class WorklogMcp
 [McpServerToolType]
 internal sealed class McpActivityTools
 {
+    [McpServerTool(Name = "worklog_episodes", ReadOnly = true),
+     Description("The fixed date as an ordered timeline of episodes (activity runs, anchors already assigned to Jira, idle and excluded gaps). Titles appear only with --include-context and follow the app's privacy rules. Frozen at launch.")]
+    public static string Episodes(McpActivitySnapshot snapshot) => snapshot.Episodes;
+
     [McpServerTool(Name = "worklog_activity", ReadOnly = true),
      Description("Read unresolved recorded activity from the fixed Worklog Desk date. The snapshot is frozen at launch. Times are UTC.")]
     public static string Activity(McpActivitySnapshot snapshot, int offset = 0)

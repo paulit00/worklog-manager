@@ -13,7 +13,10 @@ internal sealed record Preferences(
     bool Communications = false, int IdleMinutes = 2, int WorkdayMinutes = 480,
     string TimeZoneId = "", RoundingMode Rounding = RoundingMode.IssueDay,
     SourceMapping[]? Mappings = null, JiraSettings? Jira = null, bool WindowTitles = true, string Theme = "Dark",
-    bool Tempo = false, string LastProject = "", CompletionReminder? CompletionReminder = null);
+    bool Tempo = false, string LastProject = "", CompletionReminder? CompletionReminder = null,
+    string[]? AssistedTitlesOff = null, DateTimeOffset? MailLabelCutoff = null, int AssistedOverheadPercent = 50,
+    bool AssistedNoticeShown = false, string OutlookTenant = "", string OutlookClient = "", string AiProvider = "",
+    string AiModel = "");
 
 internal sealed record RequestDraft(string Id, DateOnly Day, TaskLabel Task);
 internal sealed record ExportReceipt(string Issue, WorkInterval[] Intervals);
@@ -31,7 +34,10 @@ internal sealed partial class WorkStore : IDisposable
     public WorkStore(string folder, bool inMemory = false)
     {
         if (!inMemory)
+        {
             Directory.CreateDirectory(folder);
+            this.folder = folder;
+        }
         var path = inMemory ? ":memory:" : Path.Combine(folder, "worklog.db");
         connection = new SqliteConnection(new SqliteConnectionStringBuilder
         {
@@ -225,7 +231,8 @@ internal sealed partial class WorkStore : IDisposable
         new(Rows(day), ManualEntries(day), mode, TempoAttempts(day), inProgress);
 
     public void ReplaceRows(IReadOnlyCollection<string> removed, IReadOnlyCollection<Allocation> updated,
-        IReadOnlyCollection<Allocation>? expectedAssistedRows = null)
+        IReadOnlyCollection<Allocation>? expectedAssistedRows = null, IReadOnlyCollection<SegmentGuard>? guards = null,
+        Func<IReadOnlyList<Allocation>, string?>? verify = null)
     {
         CompletionChanging?.Invoke();
         if (updated.Any(row => row.End <= row.Start))
@@ -236,6 +243,14 @@ internal sealed partial class WorkStore : IDisposable
             if (removed.Count != 0)
                 throw new InvalidOperationException("Assisted review can only assign or undo an assignment for unapproved recorded activity.");
             CheckAssistedEdit(expectedAssistedRows, updated, transaction);
+            if (guards is { Count: > 0 } || verify != null)
+            {
+                var current = Rows(expectedAssistedRows.First().Day, transaction);
+                if (guards is { Count: > 0 } && AssistedGuard.CheckSegments(current, guards) is { } changed)
+                    throw new InvalidOperationException(changed);
+                if (verify?.Invoke(current) is { } refused)
+                    throw new InvalidOperationException(refused);
+            }
         }
         var taskIds = new Dictionary<TaskLabel, string>();
         foreach (var id in removed)

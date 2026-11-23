@@ -67,6 +67,19 @@ Use **Reminder settings** to opt in and choose workdays and a time in the existi
 
 In **Pilot and check-in**, choose the fixed cutoff before starting. It defaults to 18:00 in the workday time zone. The pilot starts with five worked days without cues and continues with ten worked days in the reminder period. Check in for each date, including days when you worked but capture was empty. Results stay on this PC and show cutoff closure, missing observations and verified versus manually attested entries separately. A Windows cue request records an attempt to notify. The app tracks review opens separately.
 
+## Reconstruct my day
+
+**Reconstruct my day…** in the review window sends the shown date's activity, in time order, to Claude or OpenAI in one request. It sees what came before and after each piece of work. It suggests tasks: a time range → a Jira issue, a draft for a new issue, or "needs your decision".
+
+- **Setup:** choose a provider and model, then use **API key…** (the key goes to Windows Credential Manager). For meetings, use **Connect Outlook…** with a tenant-approved Entra public client. Meetings need `Calendars.ReadBasic`; Sent Items subjects are optional and need `Mail.ReadBasic`.
+- **What is sent:** window titles by default, with Teams chat names counted first, because they are people's names. Mail stays local: Outlook titles, Outlook on the web, mail-like browser titles and Sent Items subjects are sent only when you include them for that request. Excluded, idle and internal time never sends titles. Browser titles recorded before this version are held back until Outlook is connected. Links, email addresses, phone numbers and secrets are removed first.
+- **The preview:** it lists every title by family. You can turn a family off (remembered) or untick single titles (this request only). **Prepare request** fetches your recent Jira issues: only keys and JQL go to Jira, never window text. **Show exact request** shows the body that **Send** transmits.
+- **Review:** untick episodes that belong elsewhere. Then **Accept selected…** shows the recorded time and the Tempo time per issue after rounding, and asks for a description so the worklogs can be approved. Small or heavily rounded worklogs need **Accept anyway**. One accept is one undo step.
+- **Blocked proposals:** issues that already have approved, copied or sent time today can't be changed here. **Open in Activity** handles those through the normal Assign flow. So does idle meeting time. Date navigation is locked while the window is open.
+- **Diagnostics:** `ai-diagnostics.log` in the data folder records each request's stop reason, token counts and duration, without content.
+
+For other AI assistants, `WorklogDesk.Windows.exe --mcp YYYY-MM-DD [--data FOLDER] [--include-context]` serves two read-only tools over stdio. `worklog_activity` lists unresolved rows; `worklog_episodes` gives the whole day's timeline. Titles appear only with `--include-context`, under the same rules, and that now includes titles of assigned time.
+
 ## Connect Jira Cloud
 
 Issue lookup is optional. In **Connect Jira**, enter your `.atlassian.net` site, Atlassian email, an API token allowed by your organization, and project keys. Use **Cloud ID** for a scoped token. Select **Test and save** to make a read-only account check. The token goes to Windows Credential Manager. [Atlassian API token settings and guidance](https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account)
