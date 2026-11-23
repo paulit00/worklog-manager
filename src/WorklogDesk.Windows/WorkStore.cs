@@ -71,6 +71,10 @@ internal sealed partial class WorkStore : IDisposable
             CREATE TABLE IF NOT EXISTS task (id TEXT PRIMARY KEY, payload BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS context (id TEXT PRIMARY KEY, payload BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS setting (name TEXT PRIMARY KEY, value BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS reconstruction (
+                day TEXT NOT NULL, part INTEGER NOT NULL, created_day TEXT NOT NULL, payload BLOB NOT NULL,
+                PRIMARY KEY (day, part)
+            );
             CREATE TABLE IF NOT EXISTS request (id TEXT PRIMARY KEY, day TEXT NOT NULL, payload BLOB NOT NULL);
             CREATE INDEX IF NOT EXISTS request_day ON request(day);
             CREATE TABLE IF NOT EXISTS manual_tempo (id TEXT PRIMARY KEY, day TEXT NOT NULL, payload BLOB NOT NULL);
@@ -108,6 +112,7 @@ internal sealed partial class WorkStore : IDisposable
             using var orphan = Command("DELETE FROM context WHERE NOT EXISTS (SELECT 1 FROM allocation WHERE context_id=context.id)", transaction);
             orphan.ExecuteNonQuery();
         }
+        PurgeReconstructions(before, transaction);
         transaction.Commit();
         knownContexts.Clear();
     }
@@ -405,11 +410,14 @@ internal sealed partial class WorkStore : IDisposable
         command.ExecuteNonQuery();
     }
 
-    public void ExpireSource(DateTimeOffset utcNow)
+    public void ExpireSourcesAndReconstructions(DateTimeOffset utcNow)
     {
-        using var command = Command("DELETE FROM source WHERE ended < $end", null,
+        using var transaction = connection.BeginTransaction();
+        using var command = Command("DELETE FROM source WHERE ended < $end", transaction,
             ("$end", utcNow.AddDays(-30).UtcTicks));
         command.ExecuteNonQuery();
+        PurgeReconstructions(DateOnly.FromDateTime(utcNow.LocalDateTime).AddDays(-ContextRetentionDays), transaction);
+        transaction.Commit();
     }
 
     public void CheckpointWal()

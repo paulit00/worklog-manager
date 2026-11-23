@@ -193,6 +193,9 @@ internal static class AssistedTests
         Equal(EpisodeState.Assigned, episodes[2].State);
         Equal(rows.Sum(row => row.Milliseconds), episodes.Sum(episode => episode.Milliseconds));
         Equal(rows.Length, episodes.SelectMany(episode => episode.Rows).Select(row => row.Id).Distinct().Count());
+        var original = episodes[..2];
+        var regrouped = episodes[0] with { Rows = original.SelectMany(episode => episode.Rows).ToArray() };
+        True(DayReconstruction.RowsFingerprint(original, rows) != DayReconstruction.RowsFingerprint([regrouped], rows));
 
         // A realistic day fits without the fallback; a very busy one uses 5-minute windows and still conserves time.
         var day = RealisticDay();
@@ -674,6 +677,204 @@ internal static class AssistedTests
             }
         }
     }));
+
+    public static void DialogRestore() => WithReconstructionDialog((app, store, _) =>
+    {
+        var portal = Row(1200, 1800, "VS Code", "c.cs - portal");
+        store.ReplaceRows([], [Row(0, 600, "VS Code", "a.cs - erp"), Row(600, 605, "Teams", "Chat - Bob"),
+            Row(605, 1200, "VS Code", "b.cs - erp"), portal]);
+        using (var first = OpenReconstruction(app, store))
+        {
+            LoadProposal(first, 1, 2);
+            first.EpisodeList.SetItemChecked(0, false);
+            PumpEvents();
+            first.EpisodeList.SetItemChecked(1, false);
+            PumpEvents();
+            first.Close();
+        }
+        True(store.Reconstruction(Day, 0) != null);
+        True(store.Reconstruction(Day.AddDays(1), 0) == null && store.Reconstruction(Day, 1) == null);
+        store.ReplaceRows([], [Row(2400, 3000, "Word", "notes.docx")]);
+        using (var second = OpenReconstruction(app, store))
+        {
+            Equal(1, second.ProposalCount);
+            True(second.StatusLine.StartsWith("Restored the reconstruction", StringComparison.Ordinal));
+            Equal(2, second.Unticked(0).Count);
+            second.EpisodeList.SetItemChecked(0, true);
+            PumpEvents();
+            var portalEpisode = second.Episodes.Single(episode => episode.Rows.Any(row => row.Id == portal.Id)).Number;
+            True(second.Unticked(0).SequenceEqual([portalEpisode]));
+            True(second.ProposalGrid.Rows.Cast<System.Windows.Forms.DataGridViewRow>()
+                .Any(row => (string?)row.Cells["proposal"].Value == "Not covered"));
+            True(second.Invalid(0) == null);
+            second.EpisodeList.SetItemChecked(1, true);
+            PumpEvents();
+            Equal(0, second.Unticked(0).Count);
+            second.Close();
+        }
+
+        store.ReplaceRows([], [portal with { Task = new TaskLabel("New client", Description: "Edited allocation") }]);
+        using (var third = OpenReconstruction(app, store))
+        {
+            Equal(1, third.ProposalCount);
+            True(third.Invalid(0)?.StartsWith("The activity changed", StringComparison.Ordinal) == true);
+            third.Close();
+        }
+
+        var captured = Row(1800, 2100, "VS Code", "c.cs - portal");
+        store.ReplaceRows([], [portal, captured]);
+        var host = new FakeHost();
+        using var fourth = OpenReconstruction(app, store, host);
+        True(fourth.Episodes.Any(episode => episode.Rows.Any(row => row.Id == portal.Id) && episode.Rows.Any(row => row.Id == captured.Id)));
+        True(fourth.Invalid(0)?.StartsWith("The activity changed", StringComparison.Ordinal) == true);
+        Descendants(fourth).OfType<System.Windows.Forms.Button>().Single(button => button.Text == "Open in Activity").PerformClick();
+        True(host.Opened == null);
+        fourth.Close();
+    });
+
+    public static void DialogAcceptedRestore() => WithReconstructionDialog((app, store, _) =>
+    {
+        var task = new TaskLabel("", "BC-1", "Fix posting");
+        var anchor = Row(0, 3600, "VS Code") with { Status = Disposition.Billable, Task = task };
+        var portal = Row(3600, 4500, "VS Code", "portal.cs");
+        store.ReplaceRows([], [anchor, portal]);
+        string proposalTime;
+        using (var first = OpenReconstruction(app, store))
+        {
+            LoadProposal(first, 2, 2);
+            proposalTime = (string)first.ProposalGrid.Rows[0].Cells["time"].Value!;
+            first.Close();
+        }
+
+        var saved = store.Reconstruction(Day, 0)!;
+        store.ReplaceRows([], [portal with { Status = Disposition.Billable, Task = task }]);
+        store.SaveReconstruction(Day, 0, saved with
+        {
+            Proposals = [saved.Proposals.Single() with { Outcome = 1, AcceptedIds = [portal.Id] }]
+        });
+        using (var second = OpenReconstruction(app, store))
+        {
+            Equal(1, second.Episodes.Length);
+            Equal(1, second.ProposalCount);
+            Equal("Accepted", (string?)second.ProposalGrid.Rows[0].Cells["state"].Value);
+            Equal(proposalTime, (string?)second.ProposalGrid.Rows[0].Cells["time"].Value);
+            second.Close();
+        }
+
+        store.ReplaceRows([], [portal]);
+        using var undone = OpenReconstruction(app, store);
+        Equal(1, undone.ProposalCount);
+        Equal(null, undone.Invalid(0));
+        Equal("", (string?)undone.ProposalGrid.Rows[0].Cells["state"].Value);
+        Equal(proposalTime, (string?)undone.ProposalGrid.Rows[0].Cells["time"].Value);
+        undone.Close();
+    });
+
+    public static void ActivityHandoff() => WithReconstructionDialog((app, store, _) =>
+    {
+        var start = Timeline.DayStart(app.Today, app.Zone).AddHours(9);
+        var first = Row(0, 600, "VS Code", "portal.cs") with { Day = app.Today, Start = start, End = start.AddMinutes(10) };
+        var adjoining = Row(600, 900, "VS Code", "erp.cs") with { Day = app.Today, Start = first.End, End = first.End.AddMinutes(5) };
+        store.ReplaceRows([], [first, adjoining]);
+        using var window = new ReviewWindow(app, store, openWithoutActivation: true)
+        {
+            ShowInTaskbar = false, StartPosition = System.Windows.Forms.FormStartPosition.Manual,
+            Location = new System.Drawing.Point(System.Windows.Forms.SystemInformation.VirtualScreen.Right + 32, 0)
+        };
+        window.Show();
+        PumpEvents();
+        window.Reload();
+        Equal(2, window.ActivityAt(0).Length);
+        window.AssignOverride = initial => (initial with { Description = "Fix posting" }, Disposition.Billable);
+        ((IReconstructHost)window).OpenInActivity(app.Today, [first.Id], "BC-1");
+        var rows = store.Rows(app.Today);
+        Equal("BC-1", rows.Single(row => row.Id == first.Id).Task.Issue);
+        Equal(Disposition.Unassigned, rows.Single(row => row.Id == adjoining.Id).Status);
+        window.Close();
+    });
+
+    public static void DialogScopeSaveRetry() => WithReconstructionDialog((app, store, disk) =>
+    {
+        store.ReplaceRows([], [Row(0, 600, "VS Code", "portal.cs")]);
+        using var dialog = OpenReconstruction(app, store);
+        LoadProposal(dialog, 1, 1);
+        var picker = Descendants(dialog).OfType<System.Windows.Forms.ComboBox>().Single(combo => combo.AccessibleName == "Part of the day");
+        using var locker = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=" + Path.Combine(disk, "worklog.db"));
+        locker.Open();
+        using (locker.BeginTransaction())
+        {
+            dialog.EpisodeList.SetItemChecked(0, false);
+            PumpEvents();
+            True(Descendants(dialog).OfType<System.Windows.Forms.Label>().Any(label => label.Visible && label.Text.Contains("couldn’t be saved", StringComparison.Ordinal)));
+            picker.SelectedIndex = 1;
+            Equal(0, picker.SelectedIndex);
+            Equal(1, dialog.ProposalCount);
+        }
+        picker.SelectedIndex = 1;
+        PumpEvents();
+        Equal(1, picker.SelectedIndex);
+        Equal(0, dialog.ProposalCount);
+        Equal(1, store.Reconstruction(Day, 0)!.Proposals.Single().UntickedOffsets!.Length);
+        dialog.Close();
+
+        // A reconstruction generated for an older date can coexist with its other scopes across a store reopen.
+        var whole = store.Reconstruction(Day, 0)!;
+        store.SaveReconstruction(Day, 1, whole with { Scope = 1 });
+        using var reopened = new WorkStore(disk);
+        True(reopened.Reconstruction(Day, 0) != null && reopened.Reconstruction(Day, 1) != null);
+        var generated = DateOnly.FromDateTime(whole.Created.LocalDateTime);
+        var cutoff = new DateTimeOffset(generated.AddDays(30).ToDateTime(new TimeOnly(12, 0), DateTimeKind.Local));
+        reopened.ExpireSourcesAndReconstructions(cutoff.ToUniversalTime());
+        True(reopened.Reconstruction(Day, 0) != null && reopened.Reconstruction(Day, 1) != null);
+        reopened.ExpireSourcesAndReconstructions(cutoff.AddDays(1).ToUniversalTime());
+        True(reopened.Reconstruction(Day, 0) == null && reopened.Reconstruction(Day, 1) == null);
+    }, onDisk: true);
+
+    private static void WithReconstructionDialog(Action<TrayApplication, WorkStore, string> test, bool onDisk = false) => OnSta(() => WithFolder(folder =>
+    {
+        using var app = new TrayApplication(folder, true, "reconstruct-restore", showOnStart: false, diagnostics: true);
+        try
+        {
+            var disk = Path.Combine(folder, "reconstruction-test");
+            using var store = new WorkStore(disk, inMemory: !onDisk);
+            test(app, store, disk);
+        }
+        finally { app.ShutDownDiagnostics(); }
+    }));
+
+    private static ReconstructDayDialog OpenReconstruction(TrayApplication app, WorkStore store, FakeHost? host = null)
+    {
+        var dialog = new ReconstructDayDialog(app, store, host ?? new FakeHost(), Day)
+        {
+            ShowInTaskbar = false, StartPosition = System.Windows.Forms.FormStartPosition.Manual,
+            Location = new System.Drawing.Point(System.Windows.Forms.SystemInformation.VirtualScreen.Right + 32, 0)
+        };
+        dialog.Show();
+        PumpEvents();
+        return dialog;
+    }
+
+    private static void LoadProposal(ReconstructDayDialog dialog, int first, int last)
+    {
+        var answer = JsonSerializer.Serialize(new { segments = new[] { new
+        {
+            first_episode = first, last_episode = last, action = "assign", issue = "BC-1", title = "", description = "", meeting = -1,
+            exclude_episodes = Array.Empty<int>(), confidence = "high", reason = "VS Code work"
+        } } });
+        dialog.LoadForTest(answer, [new JiraCandidate("BC-1", "Fix posting", "Open")]);
+        dialog.ProposalGrid.ClearSelection();
+        dialog.ProposalGrid.Rows[0].Selected = true;
+        PumpEvents();
+    }
+
+    private static void PumpEvents()
+    {
+        for (var index = 0; index < 30; index++)
+        {
+            System.Windows.Forms.Application.DoEvents();
+            Thread.Sleep(5);
+        }
+    }
 
     private sealed class FakeHost : IReconstructHost
     {

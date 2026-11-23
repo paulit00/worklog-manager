@@ -80,7 +80,11 @@ var checks = new (string Title, Action Check)[]
     ("Outlook Sent Items paging is bounded and stays on Graph", AssistedTests.OutlookPaging),
     ("the AI transport reports usage and turns refusals, truncation and errors into readable messages", AssistedTests.AiTransport),
     ("the MCP executable serves two read-only tools that follow the title rules", AssistedTests.McpOverStdio),
-    ("the reconstruction window fills its episode list without a refresh loop and honours unticks", AssistedTests.DialogRefresh)
+    ("the reconstruction window fills its episode list without a refresh loop and honours unticks", AssistedTests.DialogRefresh),
+    ("reopened proposals restore unticks and refuse changed activity", AssistedTests.DialogRestore),
+    ("accepted proposals retain their original range after episode merging and can reopen after undo", AssistedTests.DialogAcceptedRestore),
+    ("opening Activity assigns only the proposed rows inside a group", AssistedTests.ActivityHandoff),
+    ("scope switches retry failed saves and older days retain each part across store reopens", AssistedTests.DialogScopeSaveRetry)
 };
 var failures = 0;
 foreach (var (title, check) in checks)

@@ -137,6 +137,56 @@ internal sealed partial class WorkStore
         return new WorkStore(connection);
     }
 
+    private const string ReconstructionPrefix = "reconstruction:";
+
+    private static string ReconstructionName(DateOnly day, int part) => ReconstructionPrefix + FormatDay(day) + (part == 0 ? "" : ":" + part);
+
+    /// <summary>
+    /// The saved reconstruction of one part of a day (0 whole day, 1 morning, 2 afternoon), or null when there is none
+    /// or it can't be read any more.
+    /// </summary>
+    public SavedReconstruction? Reconstruction(DateOnly day, int part)
+    {
+        try
+        {
+            using var command = Command("SELECT payload FROM reconstruction WHERE day=$day AND part=$part", null,
+                ("$day", FormatDay(day)), ("$part", part));
+            return command.ExecuteScalar() is byte[] payload ? Unprotect<SavedReconstruction>(payload)
+                : Read<SavedReconstruction>(ReconstructionName(day, part));
+        }
+        catch (Exception error) when (error is System.Security.Cryptography.CryptographicException or System.Text.Json.JsonException or
+            InvalidOperationException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Retains encrypted reconstructions for 30 days from generation, even when reviewing an older date.</summary>
+    public void SaveReconstruction(DateOnly day, int part, SavedReconstruction value)
+    {
+        using var transaction = connection.BeginTransaction();
+        using var save = Command("""
+            INSERT INTO reconstruction VALUES ($day,$part,$created,$payload) ON CONFLICT(day,part)
+            DO UPDATE SET created_day=excluded.created_day, payload=excluded.payload
+            """, transaction, ("$day", FormatDay(day)), ("$part", part),
+            ("$created", FormatDay(DateOnly.FromDateTime(value.Created.LocalDateTime))), ("$payload", Protect(value)));
+        save.ExecuteNonQuery();
+        using var legacy = Command("DELETE FROM setting WHERE name=$name", transaction, ("$name", ReconstructionName(day, part)));
+        legacy.ExecuteNonQuery();
+        PurgeReconstructions(DateOnly.FromDateTime(DateTime.Today).AddDays(-ContextRetentionDays), transaction);
+        transaction.Commit();
+    }
+
+    private void PurgeReconstructions(DateOnly before, SqliteTransaction transaction)
+    {
+        var cutoff = FormatDay(before);
+        using var current = Command("DELETE FROM reconstruction WHERE created_day < $day", transaction, ("$day", cutoff));
+        current.ExecuteNonQuery();
+        using var legacy = Command("DELETE FROM setting WHERE name LIKE 'reconstruction:%' AND name < $name", transaction,
+            ("$name", ReconstructionPrefix + cutoff));
+        legacy.ExecuteNonQuery();
+    }
+
     public long DiskVersion()
     {
         using var command = Command("PRAGMA user_version");

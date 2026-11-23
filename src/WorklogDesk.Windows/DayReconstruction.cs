@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text.Json;
 using WorklogDesk.Core;
 
@@ -17,6 +18,24 @@ internal sealed record Segment(int Index, int First, int Last, string Action, st
 
 /// <summary>A distinct title and what happens to it under the current policy, for the summarized preview.</summary>
 internal sealed record TitleUse(string Family, string Title, long Milliseconds, TitleDecision Decision, bool New);
+
+/// <summary>
+/// One proposal as saved for later. Episode numbers change whenever the day's rows change, so the range is kept as
+/// times: <see cref="Start"/>–<see cref="End"/> covers the proposal, and each unticked episode is kept as its time range.
+/// <see cref="Rows"/> fingerprints the rows the proposal was made from, so a restore can tell when they changed.
+/// </summary>
+internal sealed record SavedProposal(Segment Segment, DateTimeOffset Start, DateTimeOffset End, string Issue, string Action,
+    string Confidence, bool IssueChanged, int Outcome, string[] AcceptedIds, SavedRange[] Unticked, string Rows,
+    string[]? SourceIds = null, int[]? UntickedOffsets = null);
+
+internal sealed record SavedRange(DateTimeOffset Start, DateTimeOffset End);
+
+/// <summary>
+/// A day's reconstruction as saved in the local store, so closing the window doesn't lose it. <see cref="Unplaced"/>
+/// holds proposals that couldn't be matched to the current episodes; they are kept and tried again next time.
+/// </summary>
+internal sealed record SavedReconstruction(DateTimeOffset Created, int Scope, string Service, string Model,
+    JiraCandidate[] Candidates, JiraCandidate[] Added, Meeting[] Meetings, SavedProposal[] Proposals, SavedProposal[]? Unplaced = null);
 
 internal sealed record IssueEffect(string Issue, long RecordedAddedMs, int RoundedAddedSeconds, int LinesBefore, int LinesAfter);
 
@@ -267,6 +286,41 @@ internal static class DayReconstruction
                 meeting, exclude.Distinct().ToArray(), confidence, Text("reason")));
         }
         return segments;
+    }
+
+    /// <summary>
+    /// Finds the episodes containing the original rows, including rows that have joined a longer assigned episode.
+    /// Older saves and ranges whose rows were replaced can still be displayed by time, subject to fingerprint verification.
+    /// </summary>
+    public static (int First, int Last)? Locate(Episode[] episodes, SavedProposal saved)
+    {
+        var ids = (saved.SourceIds ?? []).Concat(saved.AcceptedIds ?? []).ToHashSet(StringComparer.Ordinal);
+        var matching = episodes.Where(episode => episode.Rows.Any(row => ids.Contains(row.Id))).ToArray();
+        if (matching.Length == 0)
+            matching = episodes.Where(episode => Overlaps(episode, saved.Start, saved.End)).ToArray();
+        return matching.Length == 0 ? null : (matching[0].Number, matching[^1].Number);
+    }
+
+    /// <summary>The current episodes overlapping a saved (unticked) range: a split episode stays unticked in every part.</summary>
+    public static IEnumerable<int> Overlapping(Episode[] episodes, SavedRange range) =>
+        episodes.Where(episode => Overlaps(episode, range.Start, range.End)).Select(episode => episode.Number);
+
+    private static bool Overlaps(Episode episode, DateTimeOffset start, DateTimeOffset end) =>
+        episode.Start < end && start < episode.End || episode.Start == episode.End && episode.Start >= start && episode.Start <= end;
+
+    /// <summary>
+    /// Identifies the original episode grouping and all allocations overlapping its time range, using the same row
+    /// contents as the assignment guard. Episode numbers can change independently of either.
+    /// </summary>
+    public static string RowsFingerprint(Episode[] range, IReadOnlyList<Allocation> snapshot)
+    {
+        var start = range[0].Start;
+        var end = range.Max(episode => episode.End);
+        var order = range.Select(episode => episode.Rows.Select(row => row.Id));
+        var ids = order.SelectMany(episode => episode).ToHashSet(StringComparer.Ordinal);
+        var rows = snapshot.Where(row => ids.Contains(row.Id) || row.Start < end && row.End > start)
+            .OrderBy(row => row.Id, StringComparer.Ordinal);
+        return Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new { order, rows })));
     }
 
     internal static string? Check(Segment segment, Episode[] episodes, Dictionary<string, JiraCandidate> candidates, Meeting[] meetings)

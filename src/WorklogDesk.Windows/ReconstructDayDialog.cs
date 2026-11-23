@@ -37,6 +37,14 @@ internal sealed class ReconstructDayDialog : Form
         public string? Blocked { get; set; }
         public Outcome Outcome { get; set; }
         public HashSet<string> AcceptedIds { get; } = new(StringComparer.Ordinal);
+        /// <summary>Fingerprint of the rows this proposal was made from (see <see cref="DayReconstruction.RowsFingerprint"/>).</summary>
+        public string Rows { get; set; } = "";
+        /// <summary>The saved form this proposal was restored from. Its range is kept while the current mapping is unverified.</summary>
+        public SavedProposal? Saved { get; init; }
+        /// <summary>False for a restored proposal whose current episodes weren't confirmed by the row fingerprint.</summary>
+        public bool Verified { get; set; } = true;
+        public string? MappingProblem { get; set; }
+        public bool Overlaps { get; set; }
     }
 
     private static IOutlookAuth? outlook;
@@ -52,6 +60,7 @@ internal sealed class ReconstructDayDialog : Form
     private readonly TextBox model = new() { Width = 130, MaxLength = 80, AccessibleName = "AI model" };
     private readonly ComboBox scope = new() { Width = 110, DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = "Part of the day" };
     private readonly Label status = new() { AutoSize = true, MaximumSize = new Size(1_100, 0), Padding = new Padding(0, 0, 0, 6) };
+    private readonly Label saveWarning = new() { AutoSize = true, Visible = false };
     private readonly Label elapsed = new() { AutoSize = true, Padding = new Padding(6, 8, 6, 0) };
     private readonly Button cancel;
     private readonly DataGridView grid = Ui.Grid();
@@ -78,6 +87,11 @@ internal sealed class ReconstructDayDialog : Form
     private bool busy;
     private bool dayBlocked;
     private bool updatingList;
+    private bool dirty;
+    private int activeScope;
+    // The reconstruction being reviewed, as saved for this day: when it was made, for which part of the day, and by what.
+    private (DateTimeOffset Created, int Scope, string Service, string Model)? origin;
+    private SavedProposal[] unplaced = [];
 
     public ReconstructDayDialog(TrayApplication app, WorkStore store, IReconstructHost host, DateOnly day)
     {
@@ -98,7 +112,10 @@ internal sealed class ReconstructDayDialog : Form
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         Controls.Add(layout);
-        layout.Controls.Add(status, 0, 0);
+        var messages = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+        messages.Controls.Add(status);
+        messages.Controls.Add(saveWarning);
+        layout.Controls.Add(messages, 0, 0);
 
         provider.Items.AddRange([AiService.Claude, AiService.OpenAI]);
         provider.SelectedItem = AiService.For(app.Settings.AiProvider);
@@ -106,6 +123,12 @@ internal sealed class ReconstructDayDialog : Form
         provider.SelectedIndexChanged += (_, _) => model.Text = Service.DefaultModel;
         scope.Items.AddRange(["Whole day", "Morning", "Afternoon"]);
         scope.SelectedIndex = 0;
+        actions.Add(scope);
+        scope.SelectedIndexChanged += (_, _) =>
+        {
+            if (Visible && !busy)
+                Run(cancel => Restore(scope.SelectedIndex, cancel));
+        };
         var reconstruct = Button("Reconstruct day…", (_, _) => Run(Reconstruct), 140);
         Ui.Primary(reconstruct);
         layout.Controls.Add(FinishWorklogWindow.Bar(provider, model, Button("API key…", (_, _) => EditKey(), 85),
@@ -134,9 +157,19 @@ internal sealed class ReconstructDayDialog : Form
             // Items added while filling the list raise ItemCheck too; only user clicks change a proposal.
             if (updatingList)
                 return;
-            var index = e.Index;
+            if (busy || SelectedProposals() is not [var proposal] || proposal.Outcome != Outcome.Open || proposal.MappingProblem != null)
+            {
+                e.NewValue = e.CurrentValue;
+                return;
+            }
+            var episode = Range(proposal)[e.Index];
+            if (episode.State != EpisodeState.Unassigned)
+            {
+                e.NewValue = e.CurrentValue;
+                return;
+            }
             var included = e.NewValue == CheckState.Checked;
-            BeginInvoke(() => EpisodeChecked(index, included));
+            BeginInvoke(() => EpisodeChecked(proposal, episode.Number, included));
         };
 
         var accept = Button("Accept selected…", (_, _) => AcceptSelected(), 135);
@@ -224,29 +257,30 @@ internal sealed class ReconstructDayDialog : Form
     // ----- Loading -------------------------------------------------------------------------------------------------
 
     /// <summary>Reads the day, its guard data and 30 days of history on a separate read-only connection, off the UI thread.</summary>
-    private async Task Load(CancellationToken cancel)
+    private async Task LoadRequestDay(CancellationToken cancel)
     {
         status.Text = "Reading the day and the last 30 days of history…";
-        var reader = store.OpenReader();
+        using var reader = store.OpenReader();
         (List<Allocation> Rows, GuardData Guard, List<(DateOnly, List<Allocation>, List<ManualEntry>)> History) loaded;
         if (reader == null)
             loaded = (store.Rows(day), store.ReadGuardData(day), store.History(day.AddDays(-30), day.AddDays(-1)));
         else
-            loaded = await Task.Run(() =>
-            {
-                using (reader)
-                    return (reader.Rows(day), reader.ReadGuardData(day), reader.History(day.AddDays(-30), day.AddDays(-1)));
-            }, cancel);
+            loaded = await Task.Run(() => (reader.Rows(day), reader.ReadGuardData(day), reader.History(day.AddDays(-30), day.AddDays(-1))), cancel);
+        cancel.ThrowIfCancellationRequested();
         snapshot = loaded.Rows;
         guard = loaded.Guard;
         history = loaded.History;
         horizon = snapshot.Count == 0 ? DateTimeOffset.MinValue : snapshot.Max(row => row.End);
         seenTitles = history.SelectMany(item => item.Rows).SelectMany(row => AssistedEvidence.Titles(row.Context)).ToHashSet(StringComparer.Ordinal);
         dayBlocked = AssistedGuard.DayBlocked(guard);
+        episodes = BuildEpisodes(snapshot, activeScope);
+    }
+
+    private Episode[] BuildEpisodes(IReadOnlyList<Allocation> rows, int part)
+    {
         var noon = Timeline.AtLocalTime(day, new TimeOnly(12, 0), Zone);
-        var part = (Scope)scope.SelectedIndex;
-        var rows = snapshot.Where(row => part == Scope.Day || (part == Scope.Morning ? row.Start < noon : row.Start >= noon)).ToList();
-        episodes = DayEpisodes.Build(rows, Timeline.DayStart(day, Zone));
+        var scoped = rows.Where(row => part == (int)Scope.Day || (part == (int)Scope.Morning ? row.Start < noon : row.Start >= noon)).ToArray();
+        return DayEpisodes.Build(scoped, Timeline.DayStart(day, Zone));
     }
 
     private TitlePolicy Policy(bool mailSubjects = false, bool olderBrowser = false, IReadOnlySet<string>? unticked = null) =>
@@ -257,6 +291,8 @@ internal sealed class ReconstructDayDialog : Form
 
     private async Task Reconstruct(CancellationToken cancel)
     {
+        if (!TrySaveState())
+            return;
         if (!app.Settings.AssistedNoticeShown)
         {
             if (MessageBox.Show(this, "Reconstruct day sends window titles, including Teams chat names (people's names), Jira " +
@@ -268,7 +304,8 @@ internal sealed class ReconstructDayDialog : Form
         }
         AssistedInference.CheckModel(Service, model.Text.Trim());
         // Reloading renumbers episodes. Earlier proposals are kept aside and restored unless a new plan replaces them.
-        var earlier = (snapshot, horizon, episodes, guard, history, seenTitles, requestMeetings, proposals: proposals.ToList(), candidates);
+        var earlier = (snapshot, horizon, episodes, guard, history, seenTitles, requestMeetings, proposals: proposals.ToList(), candidates,
+            origin, unplaced, dayBlocked);
         proposals.Clear();
         RefreshGrid();
         var replaced = false;
@@ -280,7 +317,8 @@ internal sealed class ReconstructDayDialog : Form
         {
             if (!replaced && !IsDisposed)
             {
-                (snapshot, horizon, episodes, guard, history, seenTitles, requestMeetings, _, candidates) = earlier;
+                (snapshot, horizon, episodes, guard, history, seenTitles, requestMeetings, _, candidates, origin, unplaced, dayBlocked) = earlier;
+                proposals.Clear();
                 proposals.AddRange(earlier.proposals);
                 RefreshGrid();
             }
@@ -290,7 +328,7 @@ internal sealed class ReconstructDayDialog : Form
     /// <summary>Returns true when a new plan replaced the proposals; false leaves the earlier ones to be restored.</summary>
     private async Task<bool> ReconstructCore(CancellationToken cancel)
     {
-        await Load(cancel);
+        await LoadRequestDay(cancel);
         if (!episodes.Any(episode => episode.State == EpisodeState.Unassigned))
         {
             status.Text = "No unassigned recorded activity in this part of the day.";
@@ -332,9 +370,12 @@ internal sealed class ReconstructDayDialog : Form
         var segments = DayReconstruction.Parse(answer, episodes, preview.Candidates, meetings);
         candidates = preview.Candidates;
         requestMeetings = meetings;
+        origin = (DateTimeOffset.Now, activeScope, service.Name, app.IsDemo ? "demo" : modelName);
         proposals.Clear();
-        proposals.AddRange(segments.Select(segment => new Proposal(segment)));
+        proposals.AddRange(segments.Select(NewProposal));
+        unplaced = [];
         RefreshChecks();
+        SaveEdits();
         var invalid = segments.Count(segment => segment.Invalid != null);
         status.Text = $"{segments.Length} proposal(s)" + (invalid > 0 ? $", {invalid} invalid" : "") +
             ". Review the evidence, untick episodes that belong elsewhere, then accept." +
@@ -351,9 +392,211 @@ internal sealed class ReconstructDayDialog : Form
         horizon = snapshot.Count == 0 ? DateTimeOffset.MinValue : snapshot.Max(row => row.End);
         episodes = DayEpisodes.Build(snapshot, Timeline.DayStart(day, Zone));
         candidates = found;
+        origin = (DateTimeOffset.Now, activeScope, AiService.Claude.Name, "test");
         proposals.Clear();
-        proposals.AddRange(DayReconstruction.Parse(answer, episodes, candidates, meetings).Select(segment => new Proposal(segment)));
+        proposals.AddRange(DayReconstruction.Parse(answer, episodes, candidates, meetings).Select(NewProposal));
+        SaveEdits();
         RefreshChecks();
+    }
+
+    private Proposal NewProposal(Segment segment)
+    {
+        var proposal = new Proposal(segment);
+        proposal.Rows = DayReconstruction.RowsFingerprint(Range(proposal), snapshot);
+        return proposal;
+    }
+
+    internal int ProposalCount => proposals.Count;
+    internal string? Invalid(int proposal) => InvalidReason(proposals[proposal]);
+    internal Episode[] Episodes => episodes;
+    internal string StatusLine => status.Text;
+
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        Run(cancel => Restore(null, cancel));
+    }
+
+    /// <summary>
+    /// Brings back a saved reconstruction: the most recent one of the day when the window opens, or the one for the part
+    /// of the day just chosen. The day is re-read, so episodes are renumbered: each proposal is matched to the current
+    /// episodes by time and checked again.
+    /// </summary>
+    private async Task Restore(int? part, CancellationToken cancel)
+    {
+        try
+        {
+            if (TrySaveState())
+                await RestoreScope(part, cancel);
+        }
+        finally
+        {
+            if (!IsDisposed)
+                scope.SelectedIndex = activeScope;
+        }
+    }
+
+    private async Task RestoreScope(int? part, CancellationToken cancel)
+    {
+        var saved = part is { } chosen ? store.Reconstruction(day, chosen)
+            : Enumerable.Range(0, scope.Items.Count).Select(index => store.Reconstruction(day, index)).Where(item => item != null)
+                .MaxBy(item => item!.Created);
+        if (saved == null && part == null)
+            return;
+
+        var target = part ?? Math.Clamp(saved!.Scope, 0, scope.Items.Count - 1);
+        if (saved == null || saved.Proposals is not { Length: > 0 } && saved.Unplaced is not { Length: > 0 })
+        {
+            ClearReview();
+            activeScope = target;
+            status.Text = saved == null ? "No saved reconstruction for this part of the day. Reconstruct day to make one."
+                : "The saved reconstruction contains no proposals.";
+            return;
+        }
+
+        status.Text = "Reading the activity for this reconstruction…";
+        using var reader = store.OpenReader();
+        var loaded = reader == null ? store.Rows(day) : await Task.Run(() => reader.Rows(day), cancel);
+        cancel.ThrowIfCancellationRequested();
+        if (IsDisposed)
+            return;
+        var mapped = BuildEpisodes(loaded, target);
+        var byId = loaded.ToDictionary(row => row.Id, StringComparer.Ordinal);
+        var left = new List<SavedProposal>();
+        var restored = new List<Proposal>();
+        foreach (var item in (saved.Proposals ?? []).Concat(saved.Unplaced ?? []))
+        {
+            if (item?.Segment == null)
+                continue;
+            if (!Enum.IsDefined((Outcome)item.Outcome) || DayReconstruction.Locate(mapped, item) is not { } found)
+            {
+                left.Add(item);
+                continue;
+            }
+            var (first, last) = found;
+            var outcome = (Outcome)item.Outcome;
+            var ids = item.AcceptedIds ?? [];
+            var issue = item.Issue ?? "";
+            if (outcome == Outcome.Accepted && (ids.Length == 0 || ids.Any(id => !StillAssigned(byId, id, issue))))
+                outcome = Outcome.Open;
+            var verified = outcome != Outcome.Accepted && DayReconstruction.RowsFingerprint(mapped[(first - 1)..last], loaded) == item.Rows;
+            var unticked = verified && item.UntickedOffsets != null
+                ? item.UntickedOffsets.Select(offset => first + offset)
+                : (item.Unticked ?? []).Where(range => range != null).SelectMany(range => DayReconstruction.Overlapping(mapped, range));
+            var segment = item.Segment with
+            {
+                First = first, Last = last, Exclude = [], Invalid = Lasting(item.Segment.Invalid)
+            };
+            var proposal = new Proposal(segment)
+            {
+                Issue = issue, Action = item.Action ?? "", Confidence = item.Confidence ?? "", IssueChanged = item.IssueChanged,
+                Outcome = outcome, Rows = item.Rows ?? "", Saved = item, Verified = verified,
+                MappingProblem = !verified && outcome != Outcome.Accepted ? Stale : null
+            };
+            proposal.Unticked.UnionWith(unticked.Where(number => number >= first && number <= last && mapped[number - 1].State == EpisodeState.Unassigned));
+            if (outcome == Outcome.Accepted)
+                proposal.AcceptedIds.UnionWith(ids);
+            restored.Add(proposal);
+        }
+
+        // Keep the prior scope intact until the new one is ready to display.
+        var current = store.ReadGuardData(day);
+        var blocked = AssistedGuard.DayBlocked(current);
+        ClearReview();
+        activeScope = target;
+        snapshot = loaded;
+        horizon = loaded.Count == 0 ? DateTimeOffset.MinValue : loaded.Max(row => row.End);
+        episodes = mapped;
+        guard = current;
+        dayBlocked = blocked;
+        candidates = (saved.Candidates ?? []).Where(item => item?.Key != null).ToArray();
+        added.AddRange((saved.Added ?? []).Where(item => item?.Key != null));
+        requestMeetings = saved.Meetings ?? [];
+        proposals.AddRange(restored.OrderBy(item => item.Saved!.Start));
+        unplaced = left.ToArray();
+        origin = (saved.Created, target, saved.Service ?? "", saved.Model ?? "");
+        RefreshChecks(current);
+        var accepted = proposals.Count(item => item.Outcome == Outcome.Accepted);
+        var stale = proposals.Count(item => item.MappingProblem == Stale);
+        status.Text = $"Restored the reconstruction from {TimeZoneInfo.ConvertTime(saved.Created, Zone):yyyy-MM-dd HH:mm} ({saved.Service}, {saved.Model}): " +
+            $"{proposals.Count} proposal(s)" + (accepted > 0 ? $", {accepted} already accepted" : "") +
+            (stale > 0 ? $", {stale} with activity that changed since" : "") +
+            (unplaced.Length > 0 ? $". {unplaced.Length} couldn't be matched to the current activity and are hidden" : "") +
+            ". Reconstruct day again to replace it.";
+        if (grid.Rows.Count > 0)
+        {
+            grid.ClearSelection();
+            grid.Rows[0].Selected = true;
+        }
+    }
+
+    private const string Stale = "The activity changed since this reconstruction. Reconstruct day again.";
+
+    private void ClearReview()
+    {
+        proposals.Clear();
+        unplaced = [];
+        origin = null;
+        episodes = [];
+        snapshot = [];
+        guard = null;
+        dayBlocked = false;
+        candidates = [];
+        added.Clear();
+        requestMeetings = [];
+    }
+
+    /// <summary>
+    /// A saved reason that still applies after a reopen. Overlaps, stale rows and undo are worked out again from the
+    /// current state; anything else (a misnumbered exclusion, an unknown issue) came from the plan and stays.
+    /// </summary>
+    private static string? Lasting(string? reason) =>
+        reason is null or Stale || reason.StartsWith("Overlaps", StringComparison.Ordinal) || reason.StartsWith("Undone", StringComparison.Ordinal)
+            ? null : reason;
+
+    /// <summary>
+    /// Keeps a failed save pending so scope changes and closing can retry before dropping the in-memory state.
+    /// </summary>
+    private bool TrySaveState()
+    {
+        if (!dirty || origin is not { } made)
+            return true;
+        try
+        {
+            var items = proposals.Select(proposal =>
+            {
+                if (!proposal.Verified && proposal.Saved is { } prior)
+                    return prior with { Outcome = (int)proposal.Outcome, AcceptedIds = proposal.AcceptedIds.ToArray() };
+
+                var range = Range(proposal);
+                var unticked = range.Where(episode => proposal.Unticked.Contains(episode.Number)).ToArray();
+                return new SavedProposal(proposal.Segment, range[0].Start, range.Max(episode => episode.End),
+                    proposal.Issue, proposal.Action, proposal.Confidence, proposal.IssueChanged, (int)proposal.Outcome, proposal.AcceptedIds.ToArray(),
+                    unticked.Select(episode => new SavedRange(episode.Start, episode.End)).ToArray(), proposal.Rows,
+                    range.SelectMany(episode => episode.Rows).Select(row => row.Id).ToArray(),
+                    unticked.Select(episode => episode.Number - proposal.Segment.First).ToArray());
+            }).ToArray();
+            store.SaveReconstruction(day, made.Scope, new SavedReconstruction(made.Created, made.Scope, made.Service, made.Model,
+                candidates, added.ToArray(), requestMeetings, items, unplaced));
+            dirty = false;
+            saveWarning.Visible = false;
+            return true;
+        }
+        catch (Exception error) when (error is System.Data.Common.DbException or System.Security.Cryptography.CryptographicException or
+            System.IO.IOException or InvalidOperationException or System.Text.Json.JsonException or NotSupportedException)
+        {
+            saveWarning.Text = "Changes couldn’t be saved. The window will retry when you edit, switch scope, or close.";
+            saveWarning.Visible = true;
+            return false;
+        }
+    }
+
+    private void SaveEdits()
+    {
+        if (origin == null)
+            return;
+        dirty = true;
+        TrySaveState();
     }
 
     /// <summary>How many times the open proposals were re-checked (tests watch for refresh loops).</summary>
@@ -363,23 +606,29 @@ internal sealed class ReconstructDayDialog : Form
     internal IReadOnlyCollection<int> Unticked(int proposal) => proposals[proposal].Unticked;
 
     /// <summary>Re-reads the stored rows and re-checks every open proposal: blocked state and Tempo effect.</summary>
-    private void RefreshChecks()
+    private void RefreshChecks(GuardData? loaded = null)
     {
         Refreshes++;
         if (episodes.Length == 0 || proposals.Count == 0)
             return;
-        guard = store.ReadGuardData(day);
+        guard = loaded ?? store.ReadGuardData(day);
         checkedRevision = store.CompletionRevision;
         dayBlocked = AssistedGuard.DayBlocked(guard);
         // Ctrl+Z in Review undoes an accepted batch; such proposals open again.
         var stored = guard.Current.ToDictionary(row => row.Id, StringComparer.Ordinal);
+        var changed = false;
         foreach (var proposal in proposals.Where(item => item.Outcome == Outcome.Accepted && item.AcceptedIds.Any(id =>
-                     !stored.TryGetValue(id, out var row) || row.Status != Disposition.Billable || row.Task.Issue != item.Issue)))
+                     !StillAssigned(stored, id, item.Issue))))
         {
             proposal.Outcome = Outcome.Open;
             proposal.AcceptedIds.Clear();
+            // Restored accepted proposals are mapped against assigned rows. Undo requires a fresh mapping.
+            if (!proposal.Verified)
+                proposal.MappingProblem = "Undone in Review. Close and reopen this window to review it again.";
+            changed = true;
         }
-        foreach (var proposal in proposals.Where(item => item.Outcome == Outcome.Open && item.Action == "assign" && item.Segment.Invalid == null))
+        MarkOverlaps();
+        foreach (var proposal in proposals.Where(item => item.Outcome == Outcome.Open && item.Action == "assign" && InvalidReason(item) == null))
         {
             var changes = Changes(proposal, withDescription: true);
             var expected = Expected(changes);
@@ -393,7 +642,12 @@ internal sealed class ReconstructDayDialog : Form
                 };
         }
         RefreshGrid();
+        if (changed)
+            SaveEdits();
     }
+
+    private static bool StillAssigned(Dictionary<string, Allocation> rows, string id, string issue) =>
+        rows.TryGetValue(id, out var row) && row.Status == Disposition.Billable && row.Task.Issue == issue;
 
     protected override void OnActivated(EventArgs e)
     {
@@ -406,6 +660,12 @@ internal sealed class ReconstructDayDialog : Form
     // ----- Grid and details ----------------------------------------------------------------------------------------
 
     private Episode[] Range(Proposal proposal) => episodes[(proposal.Segment.First - 1)..proposal.Segment.Last];
+
+    private static (DateTimeOffset Start, DateTimeOffset End) DisplayRange(Proposal proposal, Episode[] range) =>
+        !proposal.Verified && proposal.Saved is { } saved ? (saved.Start, saved.End) : (range[0].Start, range.Max(episode => episode.End));
+
+    private static string? InvalidReason(Proposal proposal) => proposal.MappingProblem ?? proposal.Segment.Invalid ??
+        (proposal.Overlaps ? "Overlaps another proposal." : null);
 
     private TaskLabel? AnchorTask(string issue)
     {
@@ -450,6 +710,7 @@ internal sealed class ReconstructDayDialog : Form
         foreach (var proposal in proposals)
         {
             var range = Range(proposal);
+            var (start, end) = DisplayRange(proposal, range);
             var assignable = range.Where(episode => episode.State == EpisodeState.Unassigned && !proposal.Unticked.Contains(episode.Number))
                 .Sum(episode => episode.Assignable.Sum(row => row.Milliseconds));
             var review = range.Where(episode => episode.State is EpisodeState.Uncertain or EpisodeState.UnassignedOther).Sum(episode => episode.Milliseconds);
@@ -459,13 +720,14 @@ internal sealed class ReconstructDayDialog : Form
                 "draft" => $"Draft · {proposal.Segment.Title}",
                 _ => "Needs your decision"
             };
-            var index = grid.Rows.Add($"{Local(range[0].Start)}–{Local(range.Max(item => item.End))}",
-                $"{Minutes(assignable)} assignable" + (review > 0 ? $" · {Minutes(review)} needs review" : ""),
+            var recorded = proposal.Outcome == Outcome.Open && proposal.MappingProblem == null
+                ? $"{Minutes(assignable)} assignable" + (review > 0 ? $" · {Minutes(review)} needs review" : "") : "";
+            var index = grid.Rows.Add($"{Local(start)}–{Local(end)}", recorded,
                 label, EffectText(proposal), proposal.Confidence, proposal.Segment.Reason, StatusText(proposal));
             grid.Rows[index].Tag = proposal;
         }
         foreach (var episode in episodes.Where(item => item.State == EpisodeState.Unassigned &&
-                     !proposals.Any(proposal => proposal.Segment.First <= item.Number && item.Number <= proposal.Segment.Last)))
+                     !proposals.Any(proposal => proposal.Verified && proposal.Segment.First <= item.Number && item.Number <= proposal.Segment.Last)))
             grid.Rows.Add($"{Local(episode.Start)}–{Local(episode.End)}", Minutes(episode.Milliseconds), "Not covered", "", "",
                 "No proposal includes this activity. Assign it in Activity.", "");
         foreach (var index in selected.Where(index => index < grid.Rows.Count))
@@ -475,7 +737,7 @@ internal sealed class ReconstructDayDialog : Form
 
     private string EffectText(Proposal proposal)
     {
-        if (proposal.Action != "assign" || guard == null || proposal.Outcome != Outcome.Open)
+        if (proposal.Action != "assign" || guard == null || proposal.Outcome != Outcome.Open || InvalidReason(proposal) != null)
             return "";
         var changes = Changes(proposal, withDescription: true);
         if (changes.Length == 0)
@@ -491,7 +753,7 @@ internal sealed class ReconstructDayDialog : Form
     {
         Outcome.Accepted => "Accepted",
         Outcome.Skipped => "Skipped",
-        _ when proposal.Segment.Invalid != null => "Invalid: " + proposal.Segment.Invalid,
+        _ when InvalidReason(proposal) is { } reason => "Invalid: " + reason,
         _ when proposal.Blocked != null => "Blocked",
         _ when proposal.Confidence == "low" && !proposal.IssueChanged && proposal.Action == "assign" => "Low confidence: change the issue to accept",
         _ => ""
@@ -513,7 +775,18 @@ internal sealed class ReconstructDayDialog : Form
                 evidence.Text = grid.SelectedRows.Count > 1 ? "Several proposals selected. Accept applies them as one batch." : "Select a proposal to see its evidence.";
                 return;
             }
-            foreach (var episode in Range(proposal))
+            if (proposal.Outcome == Outcome.Accepted)
+            {
+                evidence.Text = "Reason: " + proposal.Segment.Reason;
+                return;
+            }
+            if (proposal.MappingProblem is { } problem)
+            {
+                evidence.Lines = [problem, "Reason: " + proposal.Segment.Reason];
+                return;
+            }
+            var range = Range(proposal);
+            foreach (var episode in range)
             {
                 var titles = episode.Rows.SelectMany(row => AssistedEvidence.Titles(row.Context)
                     .Where(title => DayEpisodes.Decide(row, title, Policy()) == TitleDecision.Sent)).Distinct().Take(2);
@@ -525,13 +798,11 @@ internal sealed class ReconstructDayDialog : Form
             var details = new List<string>();
             if (proposal.Blocked != null)
                 details.Add("Blocked: " + proposal.Blocked);
-            if (proposal.Segment.Invalid != null)
-                details.Add("Invalid: " + proposal.Segment.Invalid);
+            if (InvalidReason(proposal) is { } reason)
+                details.Add("Invalid: " + reason);
             details.Add("Reason: " + proposal.Segment.Reason);
-            var range = Range(proposal);
-            var start = range[0].Start;
-            var end = range.Max(episode => episode.End);
-            foreach (var meeting in meetings.Where(item => item.Start < end && start < item.End))
+            var (start, end) = DisplayRange(proposal, range);
+            foreach (var meeting in requestMeetings.Where(item => item != null && item.Start < end && start < item.End))
             {
                 var idle = snapshot.Where(row => row.Kind == SpanKind.Idle && row.Status == Disposition.Unassigned &&
                     row.Start < meeting.End && meeting.Start < row.End).Sum(row => row.Milliseconds);
@@ -566,35 +837,31 @@ internal sealed class ReconstructDayDialog : Form
         _ => "other"
     };
 
-    private void EpisodeChecked(int index, bool included)
+    private void EpisodeChecked(Proposal proposal, int episode, bool included)
     {
-        if (updatingList || SelectedProposals() is not [var proposal] || index < 0)
+        if (IsDisposed || busy || !proposals.Contains(proposal) || proposal.Outcome != Outcome.Open || proposal.MappingProblem != null)
             return;
-        var episode = Range(proposal)[index];
-        if (episode.State != EpisodeState.Unassigned)
-        {
-            ShowSelected();
-            return;
-        }
         if (included)
-            proposal.Unticked.Remove(episode.Number);
+            proposal.Unticked.Remove(episode);
         else
-            proposal.Unticked.Add(episode.Number);
+            proposal.Unticked.Add(episode);
+        SaveEdits();
         RefreshChecks();
     }
 
     private void IncludeShort()
     {
-        if (SelectedProposals() is not [var proposal])
+        if (SelectedProposals() is not [var proposal] || !CanEditProposal(proposal))
             return;
         foreach (var episode in Range(proposal).Where(item => item.Milliseconds < 120_000))
             proposal.Unticked.Remove(episode.Number);
+        SaveEdits();
         RefreshChecks();
     }
 
     private void OpenInActivity()
     {
-        if (SelectedProposals() is not [var proposal])
+        if (SelectedProposals() is not [var proposal] || !CanEditProposal(proposal) || !CheckCurrentActivity(proposal))
             return;
         // Only the ticked, assignable rows: never excluded bridges, idle, internal, anchors or unticked chats.
         var ids = Range(proposal).Where(episode => episode.State == EpisodeState.Unassigned && !proposal.Unticked.Contains(episode.Number))
@@ -609,11 +876,14 @@ internal sealed class ReconstructDayDialog : Form
 
     private void Skip()
     {
-        var selected = SelectedProposals();
+        var selected = SelectedProposals().Where(proposal => proposal.Outcome == Outcome.Open).ToArray();
+        if (selected.Length == 0)
+            return;
         foreach (var proposal in selected)
             proposal.Outcome = Outcome.Skipped;
         var next = grid.SelectedRows.Cast<DataGridViewRow>().Select(row => row.Index).DefaultIfEmpty(-1).Max() + 1;
-        RefreshGrid();
+        SaveEdits();
+        RefreshChecks();
         grid.ClearSelection();
         if (next > 0 && next < grid.Rows.Count)
             grid.Rows[next].Selected = true;
@@ -621,13 +891,43 @@ internal sealed class ReconstructDayDialog : Form
 
     // ----- Editing proposals ---------------------------------------------------------------------------------------
 
+    private bool CanEditProposal(Proposal proposal)
+    {
+        if (proposal.Outcome != Outcome.Open)
+        {
+            status.Text = "Select one open proposal.";
+            return false;
+        }
+        if (proposal.MappingProblem is not { } reason)
+            return true;
+        status.Text = reason;
+        return false;
+    }
+
+    private bool CheckCurrentActivity(Proposal proposal)
+    {
+        try
+        {
+            if (DayReconstruction.RowsFingerprint(Range(proposal), store.Rows(day)) == proposal.Rows)
+                return true;
+            status.Text = Stale;
+        }
+        catch (System.Data.Common.DbException)
+        {
+            status.Text = "Local storage is busy. Try again in a moment.";
+        }
+        return false;
+    }
+
     private void ChangeIssue()
     {
-        if (SelectedProposals() is not [var proposal] || proposal.Outcome != Outcome.Open)
+        if (SelectedProposals() is not [var proposal])
         {
             status.Text = "Select one open proposal.";
             return;
         }
+        if (!CanEditProposal(proposal))
+            return;
         var keys = candidates.Concat(added).Select(candidate => $"{candidate.Key} · {candidate.Summary}").ToArray();
         using var picker = new ComboBox { Width = 380, DropDownStyle = ComboBoxStyle.DropDown, Text = proposal.Issue };
         picker.Items.AddRange(keys);
@@ -652,6 +952,7 @@ internal sealed class ReconstructDayDialog : Form
         proposal.IssueChanged = true;
         // The user's issue replaces the AI's proposal for this range; anchors must still match it.
         proposal.Segment = proposal.Segment with { Invalid = Revalidate(proposal) };
+        SaveEdits();
         RefreshChecks();
     }
 
@@ -669,11 +970,13 @@ internal sealed class ReconstructDayDialog : Form
 
     private void CreateIssue()
     {
-        if (SelectedProposals() is not [var proposal] || proposal.Outcome != Outcome.Open)
+        if (SelectedProposals() is not [var proposal])
         {
             status.Text = "Select one open proposal.";
             return;
         }
+        if (!CanEditProposal(proposal) || !CheckCurrentActivity(proposal))
+            return;
         // The AI's draft text reaches Jira only through the editable, confirmed create dialog.
         var draft = proposal.Segment.Action == "draft";
         if (app.CreateJiraIssue(this, draft ? proposal.Segment.Title : "", draft ? proposal.Segment.Description : "") is not { } issue)
@@ -684,6 +987,7 @@ internal sealed class ReconstructDayDialog : Form
         proposal.Confidence = "medium";
         proposal.IssueChanged = true;
         proposal.Segment = proposal.Segment with { Invalid = Revalidate(proposal) };
+        SaveEdits();
         RefreshChecks();
         status.Text = $"{issue.Key} created. The proposal now assigns to it; review and accept.";
     }
@@ -695,44 +999,43 @@ internal sealed class ReconstructDayDialog : Form
             status.Text = "Select one open proposal that covers more than one episode.";
             return;
         }
+        if (!CanEditProposal(proposal))
+            return;
         var range = Range(proposal);
         using var picker = new ComboBox { Width = 380, DropDownStyle = ComboBoxStyle.DropDownList };
         foreach (var episode in range.Skip(1))
             picker.Items.Add($"{episode.Number}: starts {Local(episode.Start)} · {Describe(episode)}");
         picker.SelectedIndex = 0;
-        if (!Prompt("Split proposal", "The second part starts at this episode. Both parts keep the issue at medium confidence.", ("Split at", picker)))
+        if (!Prompt("Split proposal", "The second part starts at this episode. Both parts keep the issue.", ("Split at", picker)))
             return;
         var at = range[picker.SelectedIndex + 1].Number;
-        var first = proposal.Segment with { Last = at - 1, Exclude = proposal.Segment.Exclude.Where(number => number < at).ToArray() };
-        var second = proposal.Segment with { First = at, Exclude = proposal.Segment.Exclude.Where(number => number >= at).ToArray() };
+        var first = proposal.Segment with { Last = at - 1, Exclude = [] };
+        var second = proposal.Segment with { First = at, Exclude = [] };
+        var byKey = candidates.Concat(added).DistinctBy(item => item.Key).ToDictionary(item => item.Key, StringComparer.Ordinal);
         var position = proposals.IndexOf(proposal);
         proposals.RemoveAt(position);
         foreach (var (part, offset) in new[] { (first, 0), (second, 1) })
         {
-            var piece = new Proposal(part) { Issue = proposal.Issue, Action = proposal.Action, Confidence = proposal.Confidence, IssueChanged = proposal.IssueChanged };
-            piece.Unticked.Clear();
+            var effective = proposal.IssueChanged ? part with { Action = "assign", Issue = proposal.Issue, Title = "", Description = "" } : part;
+            var piece = NewProposal(part with { Invalid = DayReconstruction.Check(effective, episodes, byKey, requestMeetings) });
+            piece.Issue = proposal.Issue;
+            piece.Action = proposal.Action;
+            piece.Confidence = proposal.Confidence;
+            piece.IssueChanged = proposal.IssueChanged;
             piece.Unticked.UnionWith(proposal.Unticked.Where(number => number >= part.First && number <= part.Last));
-            piece.Segment = part with
-            {
-                Invalid = DayReconstruction.Check(part with { Issue = piece.Issue, Action = piece.Action, Exclude = piece.Unticked.ToArray() },
-                    episodes, candidates.Concat(added).DistinctBy(item => item.Key).ToDictionary(item => item.Key, StringComparer.Ordinal), requestMeetings)
-            };
             proposals.Insert(position + offset, piece);
         }
-        MarkOverlaps();
+        SaveEdits();
         RefreshChecks();
     }
 
-    /// <summary>After an edit, proposals that overlap another open one are invalid again.</summary>
+    /// <summary>Only editable mappings reserve their episodes. An accepted or stale mapping can span neighbouring proposals.</summary>
     private void MarkOverlaps()
     {
-        var open = proposals.Where(item => item.Outcome == Outcome.Open).ToArray();
-        foreach (var proposal in open)
-            if (open.Any(other => other != proposal && other.Segment.First <= proposal.Segment.Last && proposal.Segment.First <= other.Segment.Last))
-                proposal.Segment = proposal.Segment with { Invalid = "Overlaps another proposal." };
+        var editable = proposals.Where(item => item.Outcome == Outcome.Open && item.Verified).ToArray();
+        foreach (var proposal in editable)
+            proposal.Overlaps = editable.Any(other => other != proposal && other.Segment.First <= proposal.Segment.Last && proposal.Segment.First <= other.Segment.Last);
     }
-
-    private bool HasUnassigned(Proposal proposal) => Range(proposal).Any(episode => episode.State == EpisodeState.Unassigned && !proposal.Unticked.Contains(episode.Number));
 
     private async Task SearchJira(CancellationToken cancel)
     {
@@ -743,6 +1046,7 @@ internal sealed class ReconstructDayDialog : Form
         var result = await catalog.SearchAssistedAsync(terms, null, cancel);
         foreach (var issue in result.Issues.Where(issue => candidates.Concat(added).All(item => item.Key != issue.Key)))
             added.Add(new JiraCandidate(issue.Key, issue.Summary, issue.Status));
+        SaveEdits();
         status.Text = $"Added {result.Issues.Count} candidate(s). Use Change issue… to apply one.";
     }
 
@@ -756,14 +1060,15 @@ internal sealed class ReconstructDayDialog : Form
             status.Text = "Select one or more open proposals.";
             return;
         }
+        RefreshChecks();
         if (dayBlocked)
         {
             status.Text = "Assisted assignment is unavailable for this date until its Tempo corrections are resolved in Worklogs.";
             return;
         }
-        if (selected.FirstOrDefault(proposal => proposal.Action != "assign" || proposal.Segment.Invalid != null) is { } wrong)
+        if (selected.FirstOrDefault(proposal => proposal.Action != "assign" || InvalidReason(proposal) != null) is { } wrong)
         {
-            status.Text = wrong.Segment.Invalid != null ? "An invalid proposal can't be accepted: " + wrong.Segment.Invalid
+            status.Text = InvalidReason(wrong) is { } reason ? "An invalid proposal can't be accepted: " + reason
                 : "Only assignments can be accepted. Use Change issue… or Create Jira issue… first.";
             return;
         }
@@ -772,7 +1077,6 @@ internal sealed class ReconstructDayDialog : Form
             status.Text = "A low-confidence proposal needs you to choose the issue first (Change issue…).";
             return;
         }
-        RefreshChecks();
         if (selected.FirstOrDefault(proposal => proposal.Blocked != null) is { } blocked)
         {
             status.Text = "Blocked: " + blocked.Blocked;
@@ -865,6 +1169,7 @@ internal sealed class ReconstructDayDialog : Form
             proposal.Outcome = Outcome.Accepted;
             proposal.AcceptedIds.UnionWith(rows.Select(row => row.Id));
         }
+        SaveEdits();
         // Later proposals keep guarding against the request-time rows; segments never share rows, and undo restores them exactly.
         RefreshChecks();
         status.Text = $"Accepted {selected.Length} proposal(s). Approve the worklogs in Review when ready. Ctrl+Z in Review undoes this batch.";
@@ -960,6 +1265,14 @@ internal sealed class ReconstructDayDialog : Form
         foreach (var (_, field) in fields)
             layout.Controls.Remove(field);
         return accepted;
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (!e.Cancel && !TrySaveState() && e.CloseReason == CloseReason.UserClosing)
+            e.Cancel = MessageBox.Show(this, "Changes still couldn’t be saved. Close and discard the unsaved changes?", "Unsaved reconstruction",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes;
+        base.OnFormClosing(e);
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)

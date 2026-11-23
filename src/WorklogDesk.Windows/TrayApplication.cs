@@ -50,7 +50,7 @@ internal sealed partial class TrayApplication : ApplicationContext
             Settings = Settings with { MailLabelCutoff = DateTimeOffset.UtcNow };
         store.SavePreferences(Settings);
         interruptedManual = store.Recover(Zone);
-        store.ExpireSource(DateTimeOffset.UtcNow);
+        store.ExpireSourcesAndReconstructions(DateTimeOffset.UtcNow);
         retentionDay = Today;
         if (demo)
             DemoData.Populate(store, Today, Zone);
@@ -508,7 +508,7 @@ internal sealed partial class TrayApplication : ApplicationContext
         }
         if (retentionDay != Today)
         {
-            store.ExpireSource(DateTimeOffset.UtcNow);
+            store.ExpireSourcesAndReconstructions(DateTimeOffset.UtcNow);
             store.CheckpointWal();
             retentionDay = Today;
         }

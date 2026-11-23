@@ -175,6 +175,8 @@ internal sealed partial class ReviewWindow
         Activate();
         tabs.SelectedIndex = 0;
         var ids = rowIds.ToHashSet(StringComparer.Ordinal);
+        if (groupActivity.Checked && visibleActivity.Any(group => group.Any(row => ids.Contains(row.Id)) && group.Any(row => !ids.Contains(row.Id))))
+            groupActivity.Checked = false;
         activity.ClearSelection();
         DataGridViewRow? first = null;
         for (var index = 0; index < visibleActivity.Length && index < activity.Rows.Count; index++)
@@ -183,8 +185,9 @@ internal sealed partial class ReviewWindow
                 activity.Rows[index].Selected = true;
                 first ??= activity.Rows[index];
             }
-        if (first == null)
+        if (first == null || Selected().Length != ids.Count)
         {
+            activity.ClearSelection();
             Notify("Those rows aren't visible. Clear the Activity filter and try again.");
             return;
         }
