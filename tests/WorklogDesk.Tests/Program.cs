@@ -2,6 +2,12 @@ using WorklogDesk.Core;
 using WorklogDesk.Windows;
 using System.Windows.Forms;
 
+if (WorklogDesk.Windows.Program.IsColdNotificationActivation(args))
+    return 0;
+if (args.Length >= 2 && args[0] == "--completion-windows-smoke")
+    return CompletionWindowsSmoke.Run(args[1], injectMessages: args.Contains("--inject-messages"),
+        operatorPass: args.Contains("--operator"), expectUnavailable: args.Contains("--expect-unavailable"));
+
 var checks = new (string Title, Action Check)[]
 {
     ("quarter-hour rounding", QuarterHour),
@@ -46,9 +52,27 @@ var checks = new (string Title, Action Check)[]
     ("a title change within one task extends context without splitting the span", ContextWithoutSplit),
     ("unassigned gaps take the nearest detected issue as a suggestion", GapSuggestions),
     ("window context is stored encrypted and purged after retention", ContextStorage),
+    ("Tempo client posts the worklog and separates refusals from unconfirmed writes", TempoClientContract),
+    ("Send to Tempo never duplicates after a lost reply and asks before adding to existing time", TempoSendFlow),
+    ("completion cue persists deduplication, snooze, skip and terminal expiry", CompletionTests.ReminderLifecycle),
+    ("completion cue honors midnight and both DST transitions", CompletionTests.Calendar),
+    ("completion summary keeps evidence, blockers, corrections and empty days distinct", CompletionTests.Summary),
+    ("pilot freezes its phase and cutoff, and retains worked days with missing capture", CompletionTests.Pilot),
+    ("completion navigation opens the intended date and uses local review only", CompletionTests.Navigation),
+    ("one refused Tempo write leaves other approved worklogs sendable", CompletionTests.PartialSend),
+    ("new Jira tasks are created in the chosen project and assigned to you", JiraCreate),
+    ("start with Windows registers and removes the current-user startup entry", StartupEntry),
     ("scoped Jira authentication is confined to the gateway", JiraScoped),
     ("project search includes colleague issues and pins continuation", JiraSearch),
-    ("Jira rejects redirects and untrusted sites", JiraRejectsRedirect)
+    ("Jira rejects redirects and untrusted sites", JiraRejectsRedirect),
+    ("assisted edits refuse stale snapshots and timing changes, and undo cleanly", AssistedTests.StaleAssignment),
+    ("assisted edits cannot touch copied or entered time", AssistedTests.ProtectedTime),
+    ("malformed or out-of-scope AI responses are rejected without crashing", AssistedTests.MalformedResponses),
+    ("Claude requests use structured output, fallbacks and Anthropic headers, and handle refusals", AssistedTests.ClaudeProvider),
+    ("AI requests omit window text and subjects unless opted in, and redact links and keys", AssistedTests.RequestPrivacy),
+    ("Outlook Sent Items paging is bounded and stays on Graph", AssistedTests.OutlookPaging),
+    ("only Teams message links over HTTPS are accepted", AssistedTests.TeamsLinks),
+    ("the MCP executable serves one read-only tool over redirected stdio", AssistedTests.McpOverStdio)
 };
 var failures = 0;
 foreach (var (title, check) in checks)
@@ -61,7 +85,7 @@ foreach (var (title, check) in checks)
     catch (Exception error)
     {
         failures++;
-        Console.Error.WriteLine($"FAIL {title}: {error.Message}");
+        Console.Error.WriteLine($"FAIL {title}: {(Environment.GetEnvironmentVariable("WD_TRACE") == "1" ? error.ToString() : error.Message)}");
     }
 }
 Console.WriteLine($"{checks.Length - failures}/{checks.Length} passed");
@@ -649,6 +673,225 @@ static void ManualBatchPersistence() => WithStore(folder =>
         logs[0].AllocationIds.ToHashSet()));
 });
 
+static void TempoClientContract()
+{
+    string? body = null;
+    using (var handler = new JiraHandler(request =>
+    {
+        Equal("api.tempo.io", request.RequestUri!.Host);
+        Equal("Bearer", request.Headers.Authorization!.Scheme);
+        if (request.Method == HttpMethod.Get)
+        {
+            True(request.RequestUri.PathAndQuery.Contains("/4/worklogs/user/acc-1?from=2026-01-01&to=2026-01-01"));
+            return JiraHandler.Json("""{"results":[{"tempoWorklogId":7,"issue":{"id":101},"timeSpentSeconds":900,"startDate":"2026-01-01","startTime":"09:00:00","description":"Fix"}]}""");
+        }
+        body = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+        return JiraHandler.Json("""{"tempoWorklogId":8,"issue":{"id":101},"timeSpentSeconds":1800,"startDate":"2026-01-01","startTime":"10:00:00","description":"Deploy"}""");
+    }))
+    using (var tempo = new TempoClient("secret", handler))
+    {
+        var day = tempo.DayAsync("acc-1", new DateOnly(2026, 1, 1), CancellationToken.None).GetAwaiter().GetResult().Single();
+        Equal(7L, day.Id);
+        Equal("09:00:00", day.StartTime);
+        var draft = new TempoDraft(101, "acc-1", 1800, new DateOnly(2026, 1, 1), "10:00:00", "Deploy");
+        Equal(8L, tempo.CreateAsync(draft, CancellationToken.None).GetAwaiter().GetResult().Id);
+        foreach (var part in new[] { "\"issueId\":101", "\"timeSpentSeconds\":1800", "\"startDate\":\"2026-01-01\"",
+            "\"startTime\":\"10:00:00\"", "\"authorAccountId\":\"acc-1\"", "\"description\":\"Deploy\"" })
+            True(body!.Contains(part, StringComparison.Ordinal));
+        True(draft.SameAs(new TempoWorklog(8, 101, 1800, new DateOnly(2026, 1, 1), "10:00:00", "Deploy ")));
+        True(!draft.SameAs(new TempoWorklog(8, 101, 900, new DateOnly(2026, 1, 1), "10:00:00", "Deploy")));
+    }
+    var sample = new TempoDraft(1, "a", 900, new DateOnly(2026, 1, 1), "09:00:00", "x");
+    Exception Failure(Func<HttpRequestMessage, HttpResponseMessage> reply)
+    {
+        using var handler = new JiraHandler(reply);
+        using var tempo = new TempoClient("secret", handler);
+        try { tempo.CreateAsync(sample, CancellationToken.None).GetAwaiter().GetResult(); }
+        catch (Exception error) { return error; }
+        throw new Exception("Expected a failure.");
+    }
+    True(Failure(_ => new HttpResponseMessage(System.Net.HttpStatusCode.BadGateway)) is TempoUncertainException);
+    True(Failure(_ => throw new HttpRequestException("reset")) is TempoUncertainException);
+    True(Failure(_ => new HttpResponseMessage(System.Net.HttpStatusCode.OK) { Content = new StringContent("{\"tempo") })
+        is TempoUncertainException);
+    var refused = Failure(_ => new HttpResponseMessage(System.Net.HttpStatusCode.BadRequest)
+        { Content = new StringContent("""{"errors":[{"message":"Period is closed"}]}""") });
+    True(refused is InvalidOperationException && refused.Message.Contains("Period is closed"));
+    True(Failure(_ => new HttpResponseMessage(System.Net.HttpStatusCode.Unauthorized)) is InvalidOperationException);
+    True(Failure(_ => new HttpResponseMessage(System.Net.HttpStatusCode.TooManyRequests)) is InvalidOperationException);
+}
+
+static void JiraCreate()
+{
+    var settings = JiraSettings.Create("https://company.atlassian.net", "demo@example.com", "", "BC", "Waiting for Customer");
+    var posts = new List<string>();
+    var assigned = "";
+    using (var handler = new JiraHandler(request =>
+    {
+        var path = request.RequestUri!.AbsolutePath;
+        if (request.Method == HttpMethod.Get && path.EndsWith("/project/search"))
+            return JiraHandler.Json("""{"values":[{"key":"BC","name":"Business Central"},{"key":"OPS","name":"Operations"}]}""");
+        if (request.Method == HttpMethod.Get && path.EndsWith("/issuetypes"))
+            return JiraHandler.Json("""{"issueTypes":[{"id":"10","name":"Task","subtask":false},{"id":"11","name":"Sub-task","subtask":true}]}""");
+        if (request.Method == HttpMethod.Post)
+        {
+            var body = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            posts.Add(body);
+            return body.Contains("assignee")
+                ? new HttpResponseMessage(System.Net.HttpStatusCode.BadRequest)
+                    { Content = new StringContent("""{"errorMessages":[],"errors":{"assignee":"Field cannot be set"}}""") }
+                : JiraHandler.Json("""{"id":"20001","key":"BC-77"}""");
+        }
+        if (request.Method == HttpMethod.Put)
+        {
+            True(path.EndsWith("/issue/BC-77/assignee"));
+            assigned = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            return new HttpResponseMessage(System.Net.HttpStatusCode.NoContent);
+        }
+        throw new Exception("Unexpected request " + path);
+    }))
+    using (var catalog = new JiraCatalog(settings, "token", handler))
+    {
+        Equal(2, catalog.ProjectsAsync("b", CancellationToken.None).GetAwaiter().GetResult().Count);
+        Equal("Task", catalog.IssueTypesAsync("BC", CancellationToken.None).GetAwaiter().GetResult().Single().Name);
+        var (issue, warning) = catalog.CreateIssueAsync(new NewJiraIssue("BC", "10", "Refresh sandbox", "Asked in Teams\nby Ona", "acc-9"),
+            CancellationToken.None).GetAwaiter().GetResult();
+        Equal("BC-77", issue.Key);
+        Equal(null, warning);
+        Equal(2, posts.Count);
+        True(posts[0].Contains("\"accountId\":\"acc-9\"") && posts[0].Contains("\"key\":\"BC\"") && posts[0].Contains("\"id\":\"10\""));
+        True(posts[1].Contains("Refresh sandbox") && posts[1].Contains("by Ona") && !posts[1].Contains("assignee"));
+        True(assigned.Contains("acc-9"));
+    }
+    using var refuse = new JiraHandler(_ => new HttpResponseMessage(System.Net.HttpStatusCode.BadRequest)
+        { Content = new StringContent("""{"errorMessages":["Summary is too vague"],"errors":{}}""") });
+    using var strict = new JiraCatalog(settings, "token", refuse);
+    try
+    {
+        strict.CreateIssueAsync(new NewJiraIssue("BC", "10", "x", "", null), CancellationToken.None).GetAwaiter().GetResult();
+        throw new Exception("Expected a refusal.");
+    }
+    catch (InvalidOperationException error) { True(error.Message.Contains("Summary is too vague")); }
+}
+
+static void StartupEntry()
+{
+    var original = StartupRegistration.RunKey;
+    StartupRegistration.RunKey = @"Software\WorklogDeskTests\Run-" + Guid.NewGuid().ToString("N");
+    try
+    {
+        True(!StartupRegistration.IsEnabled());
+        StartupRegistration.Enable(@"C:\Apps\WorklogDesk\WorklogDesk.Windows.exe");
+        True(StartupRegistration.IsEnabled());
+        Equal(@"""C:\Apps\WorklogDesk\WorklogDesk.Windows.exe""", StartupRegistration.Command());
+        StartupRegistration.Disable();
+        True(!StartupRegistration.IsEnabled());
+    }
+    finally
+    {
+        Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(StartupRegistration.RunKey, throwOnMissingSubKey: false);
+        StartupRegistration.RunKey = original;
+    }
+}
+
+static void TempoSendFlow() => WithStore(folder =>
+{
+    Exception? error = null;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            using var app = new TrayApplication(folder, false, "tempo-send", showOnStart: false, diagnostics: true);
+            using var store = new WorkStore(folder);
+            DemoData.Populate(store, app.Today, app.Zone);
+            try
+            {
+                Worklog Approve(string issue)
+                {
+                    var rows = store.Rows(app.Today);
+                    var line = Timeline.Preview(rows, RoundingMode.IssueDay).Single(item => item.Issue == issue);
+                    store.ReplaceRows([], rows.Where(row => line.AllocationIds.Contains(row.Id)).Select(row => row with
+                        { Approved = true, ApprovedMode = RoundingMode.IssueDay, ApprovedKey = line.ApprovalKey(RoundingMode.IssueDay) }).ToArray());
+                    return line;
+                }
+                var first = Approve("NW-243");
+                using var window = new ReviewWindow(app, store, openWithoutActivation: true)
+                {
+                    ShowInTaskbar = false, StartPosition = FormStartPosition.Manual,
+                    Location = new System.Drawing.Point(SystemInformation.VirtualScreen.Right + 32, 0)
+                };
+                window.Show();
+                window.Reload();
+                var fake = new FakeTempo();
+                var prompts = new List<string>();
+                window.ConfirmOverride = text => { prompts.Add(text); return !text.Contains("Tempo already has", StringComparison.Ordinal); };
+                window.TempoOverride = () => fake;
+
+                // The write reaches Tempo but the reply is lost: the line is held, not resent blindly.
+                fake.LoseReply = true;
+                window.SendToTempo().GetAwaiter().GetResult();
+                Equal(1, fake.Creates);
+                Equal(1, store.TempoPending(app.Today).Length);
+                Equal(0, store.ManualEntries(app.Today).Count);
+                True(window.WorklogState(window.ApprovedWorklogs().Single(line => line.Issue == first.Issue)).StartsWith("Send unconfirmed", StringComparison.Ordinal));
+
+                // Sending again finds the identical worklog in Tempo and records it without a second create.
+                fake.LoseReply = false;
+                window.CheckTempoStatus().GetAwaiter().GetResult();
+                Equal(1, fake.Creates);
+                Equal(0, store.TempoPending(app.Today).Length);
+                Equal("tempo-1", store.ManualEntries(app.Today).Single().Id);
+                Equal<SubmissionProvenance?>(SubmissionProvenance.VerifiedTempo, store.ManualEntries(app.Today).Single().Provenance);
+                True(window.ApprovedWorklogs().All(line => line.Issue != "NW-243"));
+
+                // Time someone entered in Tempo directly on the same issue is never added to silently.
+                var second = Approve("CED-118");
+                window.Reload();
+                fake.ReadFailure = true;
+                window.CheckTempoStatus().GetAwaiter().GetResult();
+                Equal(1, store.Completion(app.Today, RoundingMode.IssueDay).Counts.Verified);
+                Equal(1, store.Completion(app.Today, RoundingMode.IssueDay).Counts.Unknown);
+                fake.ReadFailure = false;
+                fake.Stored.Add(new TempoWorklog(99, fake.IssueId("CED-118"), 1800, app.Today, "08:00:00", "Typed in Tempo"));
+                window.SendToTempo().GetAwaiter().GetResult();
+                Equal(1, fake.Creates);
+                True(prompts.Any(text => text.Contains("Tempo already has 30m on CED-118", StringComparison.Ordinal)));
+                True(window.ApprovedWorklogs().Any(line => line.Issue == second.Issue));
+
+                // A refusal (locked period) releases the line for a corrected retry.
+                window.ConfirmOverride = _ => true;
+                fake.Refuse = true;
+                window.SendToTempo().GetAwaiter().GetResult();
+                Equal(0, store.TempoPending(app.Today).Length);
+                Equal(0, store.HandoffKeys(app.Today).Length);
+                Equal(0, store.Exports(app.Today).Length);
+                Equal(1, store.Completion(app.Today, RoundingMode.IssueDay).Counts.Refused);
+                window.OpenCompletionDate(app.Today);
+                var grid = Descendants(window).OfType<DataGridView>().Single(item => item.AccessibleName == "Proposed Tempo worklogs");
+                var target = grid.Rows.Cast<DataGridViewRow>().Single(item =>
+                    (item.Cells[6].Value as string)?.StartsWith("Tempo refused", StringComparison.Ordinal) == true);
+                grid.ClearSelection();
+                target.Selected = true;
+                Descendants(window).OfType<Button>().Single(button => button.Text == "Mark entered").PerformClick();
+                Equal(1, store.ManualEntries(app.Today).Count);
+                grid.ClearSelection();
+                fake.Refuse = false;
+                window.SendToTempo().GetAwaiter().GetResult();
+                Equal(2, fake.Creates);
+                Equal(2, store.ManualEntries(app.Today).Count);
+            }
+            finally { app.ShutDownDiagnostics(); }
+        }
+        catch (Exception observed) { error = observed; }
+    }) { IsBackground = true };
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    if (!thread.Join(TimeSpan.FromSeconds(20)))
+        throw new TimeoutException("Tempo send flow did not finish.");
+    if (error != null)
+        throw new InvalidOperationException(error.Message, error);
+});
+
 static void NativeApproval() => WithStore(folder =>
 {
     Exception? error = null;
@@ -829,8 +1072,9 @@ static void NativeApproval() => WithStore(folder =>
                 mark.PerformClick();
                 var recorded = store.ManualEntries(app.Today).Single();
                 Equal(line.ProposedSeconds, recorded.Seconds);
+                Equal<SubmissionProvenance?>(SubmissionProvenance.Manual, recorded.Provenance);
                 True(worklogs.Rows.Cast<DataGridViewRow>().Any(row => Equals(row.Cells[0].Value, issue) &&
-                    Equals(row.Cells[6].Value, $"Entered {line.ProposedSeconds / 60}m")));
+                    Equals(row.Cells[6].Value, $"Manually attested · {line.ProposedSeconds / 60}m")));
                 True(!window.ApprovedWorklogs().Any(candidate => candidate.Issue == issue));
                 var start = Timeline.DayStart(app.Today, app.Zone).AddHours(6);
                 store.ReplaceRows([], [new Allocation(Guid.NewGuid().ToString("N"), app.Today, start, start.AddMinutes(5),
@@ -939,6 +1183,9 @@ static void WithStore(Action<string> action)
     finally { folder.Delete(true); }
 }
 
+static IEnumerable<Control> Descendants(Control control) => control.Controls.Cast<Control>()
+    .SelectMany(child => Descendants(child).Prepend(child));
+
 static DateOnly Day() => new(2026, 1, 1);
 static DateTimeOffset Origin() => Timeline.DayStart(Day(), TimeZoneInfo.Utc);
 static Allocation Row(int start, int end, string issue) =>
@@ -967,4 +1214,36 @@ sealed class JiraHandler(Func<HttpRequestMessage, HttpResponseMessage> response)
     {
         Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
     };
+}
+
+
+sealed class FakeTempo : ITempoGateway
+{
+    public List<TempoWorklog> Stored { get; } = [];
+    public int Creates { get; private set; }
+    public bool LoseReply { get; set; }
+    public bool Refuse { get; set; }
+    public long? RefuseIssueId { get; set; }
+    public bool ReadFailure { get; set; }
+    public long IssueId(string key) => 1000 + (uint)StringComparer.Ordinal.GetHashCode(key) % 1000;
+
+    public Task<string> AccountAsync(CancellationToken cancel) => Task.FromResult("acc-test");
+    public Task<long> IssueIdAsync(string key, CancellationToken cancel) => Task.FromResult(IssueId(key));
+    public Task<IReadOnlyList<TempoWorklog>> DayAsync(string accountId, DateOnly date, CancellationToken cancel) => ReadFailure
+        ? Task.FromException<IReadOnlyList<TempoWorklog>>(new InvalidOperationException("Tempo authentication failed."))
+        : Task.FromResult<IReadOnlyList<TempoWorklog>>(Stored.Where(item => item.Date == date).ToArray());
+
+    public Task<TempoWorklog> CreateAsync(TempoDraft draft, CancellationToken cancel)
+    {
+        if (Refuse || RefuseIssueId == draft.IssueId)
+            throw new InvalidOperationException("Tempo refused this worklog: the period is locked.");
+        Creates++;
+        var created = new TempoWorklog(Creates, draft.IssueId, draft.Seconds, draft.Date, draft.StartTime, draft.Description);
+        Stored.Add(created);
+        if (LoseReply)
+            throw new TempoUncertainException("The connection to Tempo dropped before it confirmed the worklog.");
+        return Task.FromResult(created);
+    }
+
+    public void Dispose() { }
 }

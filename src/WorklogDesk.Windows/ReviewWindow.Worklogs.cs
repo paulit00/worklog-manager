@@ -109,6 +109,7 @@ internal sealed partial class ReviewWindow
                 }
                 throw;
             }
+            store.ConfirmHandoffKeys(day, lines.Select(line => line.ApprovalKey(Mode)));
         }
         finally
         {
@@ -132,14 +133,16 @@ internal sealed partial class ReviewWindow
         return false;
     }
 
-    private bool Ask(string text, string title, MessageBoxIcon icon) =>
-        ConfirmOverride?.Invoke(text) ?? MessageBox.Show(this, text, title, MessageBoxButtons.YesNo, icon) == DialogResult.Yes;
+    private bool Ask(string text, string title, MessageBoxIcon icon, MessageBoxDefaultButton defaultButton = MessageBoxDefaultButton.Button1) =>
+        ConfirmOverride?.Invoke(text) ?? MessageBox.Show(this, text, title, MessageBoxButtons.YesNo, icon, defaultButton) == DialogResult.Yes;
 
     private bool ConfirmHandoff(IReadOnlyList<Worklog> lines, int skipped, string action)
     {
         var history = store.Exports(Day);
         var repeated = lines.Count(line => history.Any(item =>
-            item.Intervals.Any(interval => line.Intervals.Any(interval.Overlaps))));
+            item.Intervals.Any(interval => line.Intervals.Any(interval.Overlaps))) ||
+            completionDay.HasEarlierPending(line, Mode) || completionDay.Attempts.GetValueOrDefault(line.ApprovalKey(Mode))?.State
+                == TempoAttemptState.Pending);
         var open = OpenTimeWarning();
         if (skipped == 0 && repeated == 0 && open == null)
             return true;
@@ -147,7 +150,7 @@ internal sealed partial class ReviewWindow
         if (skipped > 0)
             summary += $"\n{skipped} draft, entered or reconciliation line(s) will be left out.";
         if (repeated > 0)
-            summary += $"\n{repeated} line(s) overlap an earlier copy or export attempt. Check Tempo before re-entering them.";
+            summary += $"\n{repeated} line(s) overlap an earlier handoff or unconfirmed send. Check Tempo before re-entering them.";
         if (open != null)
             summary += "\n" + open;
         return Ask(summary, $"Review {action.ToLowerInvariant()}",
@@ -270,6 +273,348 @@ internal sealed partial class ReviewWindow
         return true;
     }
 
+    /// <summary>Test seam for the Tempo connection.</summary>
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    internal Func<ITempoGateway>? TempoOverride { get; set; }
+
+    /// <summary>
+    /// Sends approved new lines to Tempo. Reads the day from Tempo first: an identical worklog is recorded, not resent;
+    /// unrecorded time on the same issue asks first. A send that may have gone through is held until checked.
+    /// </summary>
+    internal Task SendToTempo() => RunTempoOperation(SendApprovedToTempo);
+
+    internal Task CheckTempoStatus() => RunTempoOperation(ReconcileTempo);
+
+    internal bool TempoBusy { get; private set; }
+
+    private async Task RunTempoOperation(Func<Task> operation)
+    {
+        if (TempoBusy)
+            return;
+        TempoBusy = true;
+        var commands = sendTempo.Parent;
+        var connections = tempo.Parent;
+        if (commands != null)
+            commands.Enabled = false;
+        if (connections != null)
+            connections.Enabled = false;
+        rounding.Enabled = false;
+        activity.Enabled = worklogs.Enabled = false;
+        try { await operation(); }
+        finally
+        {
+            TempoBusy = false;
+            if (commands != null)
+                commands.Enabled = true;
+            if (connections != null)
+                connections.Enabled = true;
+            rounding.Enabled = true;
+            activity.Enabled = worklogs.Enabled = true;
+            app.ResumeCompletionNavigation();
+        }
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (TempoBusy && e.CloseReason == CloseReason.UserClosing)
+            e.Cancel = true;
+        base.OnFormClosing(e);
+    }
+
+    private async Task SendApprovedToTempo()
+    {
+        var day = Day;
+        var mode = Mode;
+        if (!app.Settings.Tempo && TempoOverride == null)
+        {
+            app.ConnectTempo();
+            if (!app.Settings.Tempo)
+                return;
+        }
+        var ready = ApprovedWorklogs();
+        var picked = worklogs.SelectedRows.Cast<DataGridViewRow>().Select(row => WorklogAt(row.Index)).OfType<Worklog>()
+            .Where(ready.Contains).ToArray();
+        var lines = picked.Length > 0 ? picked : ready.ToArray();
+        if (lines.Length == 0)
+        {
+            Notify("Nothing new to send. Approve lines first; entered lines and adjustments aren't sent.");
+            return;
+        }
+        var list = string.Join("\n", lines.Take(8).Select(line =>
+            $"{line.Issue} · {LocalStart(line.Start)} · {WorklogCsv.TempoDuration(line.ProposedSeconds)} · {Shorten(line.Description)}"));
+        if (lines.Length > 8)
+            list += $"\nand {lines.Length - 8} more";
+        var total = WorklogCsv.TempoDuration(lines.Sum(line => line.ProposedSeconds));
+        var open = OpenTimeWarning();
+        if (!Ask($"Send {lines.Length} worklog(s), {total}, to Tempo for {day:yyyy-MM-dd}?\n\n{list}" +
+            (open == null ? "" : "\n\n" + open), "Send to Tempo", MessageBoxIcon.Question))
+            return;
+        if (!VerifyUnchanged(day, mode, lines, newHandoff: true))
+            return;
+
+        Notify("Sending to Tempo…");
+        int sent = 0, matched = 0, held = 0;
+        var problems = new List<string>();
+        var uncheckedLines = lines.ToHashSet();
+        try
+        {
+            using var gateway = TempoOverride?.Invoke() ?? app.OpenTempo();
+            var cancel = CancellationToken.None;
+            var account = await gateway.AccountAsync(cancel);
+            var existing = (await gateway.DayAsync(account, day, cancel)).ToList();
+            var issueIds = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (var line in lines)
+            {
+                var key = line.ApprovalKey(mode);
+                uncheckedLines.Remove(line);
+                long issueId;
+                try
+                {
+                    if (!issueIds.TryGetValue(line.Issue, out issueId))
+                        issueIds[line.Issue] = issueId = await gateway.IssueIdAsync(line.Issue, cancel);
+                }
+                catch (Exception error) when (IsTempoReadError(error))
+                {
+                    var message = ReadErrorMessage(error);
+                    MarkTempoReadFailure(day, mode, [line], message);
+                    problems.Add($"{line.Issue}: Tempo status unknown. {message}");
+                    continue;
+                }
+                if (!VerifyUnchanged(day, mode, [line], newHandoff: true))
+                    continue;
+                var prior = completionDay.Attempts.GetValueOrDefault(key);
+                if (completionDay.HasEarlierPending(line, mode))
+                {
+                    held++;
+                    problems.Add($"{line.Issue}: check an earlier unconfirmed worklog before sending.");
+                    continue;
+                }
+                var draft = Draft(day, line, account, issueId);
+                var exact = existing.Where(draft.SameAs).ToArray();
+                var known = store.ManualEntries(day).Select(entry => entry.Id).ToHashSet(StringComparer.Ordinal);
+                if (exact is [{ } same] && !known.Contains(EntryId(same.Id)))
+                {
+                    Record(day, mode, line, same.Id, key);
+                    matched++;
+                    continue;
+                }
+                if (exact.Length > 0)
+                {
+                    if (exact.Length > 1)
+                        app.CompletionDuplicate(day, exact.Select(item => item.Id));
+                    HoldRemoteConflict(day, key, line, mode, prior, "Tempo has multiple matches or a match already used by another line.");
+                    held++;
+                    problems.Add($"{line.Issue}: matching Tempo time needs reconciliation.");
+                    continue;
+                }
+                if (prior?.State == TempoAttemptState.ReadFailed)
+                    store.SetTempoAttempt(day, key, prior.RequiresManualHandoff ? prior with { State = TempoAttemptState.Refused } : null);
+                var unrecorded = existing.Where(worklog => worklog.IssueId == issueId && !known.Contains(EntryId(worklog.Id))).ToArray();
+                if (unrecorded.Length > 0 && !Ask(
+                    $"Tempo already has {WorklogCsv.TempoDuration(unrecorded.Sum(item => item.Seconds))} on {line.Issue} for this day " +
+                    "that this app didn't send or record. Sending adds another worklog.\n\nSend this line anyway?",
+                    "Existing Tempo time", MessageBoxIcon.Warning))
+                {
+                    problems.Add($"{line.Issue}: skipped, Tempo already has time on it");
+                    continue;
+                }
+                var earlierPending = prior?.State == TempoAttemptState.Pending;
+                if (earlierPending && !Ask(
+                    $"An earlier send of {line.Issue} wasn't confirmed, and Tempo shows no matching worklog now. Send it again?",
+                    "Unconfirmed send", MessageBoxIcon.Warning))
+                {
+                    held++;
+                    continue;
+                }
+                if (!VerifyUnchanged(day, mode, [line], newHandoff: true))
+                    continue;
+                store.SetTempoAttempt(day, key, new TempoAttempt(TempoAttemptState.Pending, line, mode,
+                    RequiresManualHandoff: prior?.RequiresManualHandoff == true));
+                try
+                {
+                    var created = await gateway.CreateAsync(draft, cancel);
+                    if (created.Id <= 0 || !draft.SameAs(created) || known.Contains(EntryId(created.Id)))
+                        throw new TempoUncertainException("Tempo replied with a receipt that needs reconciliation.");
+                    Record(day, mode, line, created.Id, key);
+                    existing.Add(created);
+                    sent++;
+                }
+                catch (TempoUncertainException error)
+                {
+                    held++;
+                    problems.Add($"{line.Issue}: {error.Message} Send to Tempo again checks Tempo before resending.");
+                }
+                catch (InvalidOperationException error)
+                {
+                    store.SetTempoAttempt(day, key, new TempoAttempt(earlierPending ? TempoAttemptState.Pending : TempoAttemptState.Refused,
+                        line, mode, error.Message, RequiresManualHandoff: true));
+                    problems.Add($"{line.Issue}: {error.Message}");
+                }
+            }
+        }
+        catch (Exception error) when (IsTempoReadError(error))
+        {
+            var message = ReadErrorMessage(error);
+            MarkTempoReadFailure(day, mode, uncheckedLines, message);
+            problems.Add(message);
+        }
+        Reload();
+        var summary = new List<string>();
+        if (sent > 0) summary.Add($"Sent {sent} worklog(s) to Tempo");
+        if (matched > 0) summary.Add($"{matched} already in Tempo, recorded");
+        if (held > 0) summary.Add($"{held} unconfirmed, held");
+        Notify(string.Join(". ", summary.Concat(problems.Take(2))) + (problems.Count > 2 ? $" (+{problems.Count - 2} more)" : "") +
+            (summary.Count + problems.Count == 0 ? "Nothing was sent." : "."));
+        if (problems.Count > 0)
+        {
+            if (ConfirmOverride != null)
+                ConfirmOverride(string.Join("\n", problems));
+            else
+                MessageBox.Show(this, string.Join("\n", problems), "Send to Tempo", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private async Task ReconcileTempo()
+    {
+        var day = Day;
+        var mode = Mode;
+        Reload();
+        var selected = ApprovedWorklogs();
+        var candidates = selected.Concat(preview.Where(line => coverages[line].Entry is { Provenance: null } entry &&
+            entry.Id.StartsWith("tempo-", StringComparison.Ordinal) &&
+            completionDay.States[line] == CompletionLineState.Attested)).Distinct().ToArray();
+        var active = candidates.Select(line => line.ApprovalKey(mode)).ToHashSet(StringComparer.Ordinal);
+        var priorEntries = candidates.ToDictionary(line => line.ApprovalKey(mode), line => coverages[line].Entry);
+        var currentAttempts = store.TempoAttempts(day);
+        var items = candidates.Select(line => (Key: line.ApprovalKey(mode), Line: (Worklog?)line, Mode: mode, Detached: false))
+            .Concat(currentAttempts.Where(item => item.Value.State == TempoAttemptState.Pending && !active.Contains(item.Key))
+                .Select(item => (item.Key, item.Value.Line, item.Value.Mode, Detached: true))).ToArray();
+        if (items.Length == 0)
+        {
+            Notify("No approved or unconfirmed worklogs to check.");
+            return;
+        }
+        var checkedKeys = new HashSet<string>(StringComparer.Ordinal);
+        var notes = new List<string>();
+        var matches = 0;
+        try
+        {
+            using var gateway = TempoOverride?.Invoke() ?? app.OpenTempo();
+            var account = await gateway.AccountAsync(CancellationToken.None);
+            var remote = await gateway.DayAsync(account, day, CancellationToken.None);
+            var issueIds = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (var (key, line, lineMode, detached) in items)
+            {
+                var prior = currentAttempts.GetValueOrDefault(key);
+                if (line == null)
+                {
+                    var recordedIds = store.ManualEntries(day).Select(entry => entry.Id).ToHashSet(StringComparer.Ordinal);
+                    if (remote.All(entry => recordedIds.Contains(EntryId(entry.Id))) && Ask(
+                        "The older attempt has no saved line details. Every worklog returned by Tempo for this date is already linked to a local entry. " +
+                        "Clear the attempt only after verifying there is nothing else to reconcile for this date in Tempo.",
+                        "Clear older attempt?", MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2))
+                        store.SetTempoAttempt(day, key, null);
+                    else
+                        notes.Add("An older unconfirmed attempt has no line details. Use the original rounding mode and check the worklog in Tempo.");
+                    continue;
+                }
+                if (!issueIds.TryGetValue(line.Issue, out var issueId))
+                    issueIds[line.Issue] = issueId = await gateway.IssueIdAsync(line.Issue, CancellationToken.None);
+                checkedKeys.Add(key);
+                var draft = Draft(day, line, account, issueId);
+                var exact = remote.Where(draft.SameAs).ToArray();
+                var priorEntry = priorEntries.GetValueOrDefault(key);
+                var known = store.ManualEntries(day).Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
+                if (exact is [{ } same] && (priorEntry == null ? !known.Contains(EntryId(same.Id)) : priorEntry.Id == EntryId(same.Id)))
+                {
+                    if (detached || (priorEntry == null ? VerifyUnchanged(day, lineMode, [line], newHandoff: true)
+                        : LegacyReceiptStillApplies(key, priorEntry.Id)))
+                    {
+                        Record(day, lineMode, line, same.Id, key);
+                        matches++;
+                    }
+                    continue;
+                }
+                if (exact.Length > 1)
+                    app.CompletionDuplicate(day, exact.Select(item => item.Id));
+                var unmatched = remote.Count(entry => entry.IssueId == issueId && !known.Contains(EntryId(entry.Id)));
+                if (exact.Length > 0 || unmatched > 0)
+                {
+                    notes.Add($"{line.Issue}: Tempo has time that needs manual reconciliation.");
+                    if (priorEntry == null)
+                        HoldRemoteConflict(day, key, line, lineMode, prior, notes[^1]);
+                    continue;
+                }
+                if (detached && Ask($"Tempo returned no match for the earlier {line.Issue} attempt. " +
+                    "Check the date, issue and start in Tempo. Clear this earlier attempt only after confirming it did not create a worklog.",
+                    "Clear earlier attempt?", MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2))
+                    store.SetTempoAttempt(day, key, null);
+                else if (prior?.State is TempoAttemptState.ReadFailed or TempoAttemptState.RemoteConflict)
+                    store.SetTempoAttempt(day, key, prior.RequiresManualHandoff ? prior with { State = TempoAttemptState.Refused } : null);
+                else if (prior?.State == TempoAttemptState.Pending)
+                    notes.Add($"{line.Issue}: no matching receipt found. The earlier send is still unconfirmed.");
+            }
+        }
+        catch (Exception error) when (IsTempoReadError(error))
+        {
+            var message = ReadErrorMessage(error);
+            MarkTempoReadFailure(day, mode, selected.Where(line => !checkedKeys.Contains(line.ApprovalKey(mode))), message);
+            notes.Add("Tempo status unknown. " + message);
+        }
+        Reload();
+        Notify($"{matches} matching Tempo receipt(s) recorded. " + string.Join(" ", notes.Distinct().Take(2)));
+        if (notes.Count > 2 && ConfirmOverride == null)
+            MessageBox.Show(this, string.Join("\n", notes.Distinct()), "Check Tempo status");
+    }
+
+    private bool LegacyReceiptStillApplies(string key, string id)
+    {
+        Reload();
+        return preview.Any(line => line.ApprovalKey(Mode) == key && coverages[line].Entry?.Id == id &&
+            completionDay.States[line] == CompletionLineState.Attested);
+    }
+
+    private void MarkTempoReadFailure(DateOnly day, RoundingMode mode, IEnumerable<Worklog> lines, string message)
+    {
+        var attempts = store.TempoAttempts(day);
+        foreach (var line in lines)
+        {
+            var key = line.ApprovalKey(mode);
+            var current = attempts.GetValueOrDefault(key);
+            if (current?.State != TempoAttemptState.Pending)
+                store.SetTempoAttempt(day, key, new TempoAttempt(TempoAttemptState.ReadFailed, line, mode, message,
+                    current?.RequiresManualHandoff == true));
+        }
+    }
+
+    private void HoldRemoteConflict(DateOnly day, string key, Worklog line, RoundingMode mode, TempoAttempt? prior, string reason)
+    {
+        if (prior?.State != TempoAttemptState.Pending)
+            store.SetTempoAttempt(day, key, new TempoAttempt(TempoAttemptState.RemoteConflict, line, mode, reason,
+                prior?.RequiresManualHandoff == true));
+    }
+
+    private TempoDraft Draft(DateOnly day, Worklog line, string account, long issueId) =>
+        new(issueId, account, line.ProposedSeconds, day, LocalStart(line.Start), line.Description);
+
+    private static bool IsTempoReadError(Exception error) => error is InvalidOperationException or ArgumentException or
+        HttpRequestException or TaskCanceledException or System.Text.Json.JsonException or KeyNotFoundException or FormatException;
+
+    private static string ReadErrorMessage(Exception error) => error is TaskCanceledException ?
+        "Jira or Tempo did not respond in time." : error.Message;
+
+    private static string EntryId(long tempoId) => "tempo-" + tempoId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    private static string Shorten(string text) => text.Length <= 48 ? text : text[..47] + "…";
+
+    private void Record(DateOnly day, RoundingMode mode, Worklog line, long tempoId, string key)
+    {
+        store.SaveManualEntries(day, [new ManualEntry(EntryId(tempoId), line.Issue, mode, line.ProposedSeconds,
+            line.AllocationIds.ToArray(), line.Start, line.Intervals.ToArray(), line.Description,
+            SubmissionProvenance.VerifiedTempo, app.CompletionNow)], clearAttempts: [key]);
+        app.CompletionSubmission(day, SubmissionProvenance.VerifiedTempo);
+    }
+
     private void CopyWorklogs(DateOnly day, RoundingMode mode)
     {
         var selected = worklogs.SelectedRows.Cast<DataGridViewRow>().OrderBy(row => row.Index)
@@ -309,6 +654,7 @@ internal sealed partial class ReviewWindow
         {
             SetClipboard(string.Join("\r\n", lines.Select(line =>
                 $"{line.Issue}\t{day:yyyy-MM-dd}\t{LocalStart(line.Start)}\t{WorklogCsv.TempoDuration(line.ProposedSeconds)}\t{line.Description}")));
+            store.ConfirmHandoffKeys(day, lines.Select(line => line.ApprovalKey(Mode)));
         }
         catch (System.Runtime.InteropServices.ExternalException)
         {
@@ -328,19 +674,21 @@ internal sealed partial class ReviewWindow
             coverages[line] is { Entry: null, NeedsReview: false, Consolidated: null }).ToArray();
     }
 
-    private string WorklogState(Worklog line)
+    internal string WorklogState(Worklog line)
     {
         var state = BaseWorklogState(line);
-        return state.StartsWith("Adjustment", StringComparison.Ordinal) || state.StartsWith("Merge", StringComparison.Ordinal) ||
-            state.StartsWith("Update", StringComparison.Ordinal)
-            ? correctionCopies.Contains(line.ApprovalKey(Mode)) ? state + " · copied, mark entered" : state
-            : state;
+        var coverage = coverages[line];
+        return completionDay.States[line] == CompletionLineState.Correction && !coverage.NeedsReview &&
+            (coverage.Entry != null || coverage.Consolidated != null) && line.AllocationIds.All(approvedIds.Contains) &&
+            correctionCopies.Contains(line.ApprovalKey(Mode)) ? state + " · copied, mark entered" : state;
     }
 
     private string BaseWorklogState(Worklog line)
     {
         var coverage = coverages[line];
         var needsApproval = !line.AllocationIds.All(approvedIds.Contains);
+        var key = line.ApprovalKey(Mode);
+        var attempt = completionDay.Attempts.GetValueOrDefault(key);
         if (coverage.NeedsReview)
             return "Reconcile prior entry";
         if (coverage.Consolidated is { } entries)
@@ -355,8 +703,21 @@ internal sealed partial class ReviewWindow
                 return WithApproval($"Adjustment {(seconds > 0 ? "+" : "−")}{Math.Abs(seconds) / 60}m");
             if (coverage.StartChanged(line))
                 return WithApproval(coverage.DescriptionChanged(line) ? "Update start and description" : "Update start");
-            return coverage.DescriptionChanged(line) ? WithApproval("Update description") : $"Entered {coverage.Entry!.Seconds / 60}m";
+            if (coverage.DescriptionChanged(line))
+                return WithApproval("Update description");
+            return completionDay.States[line] == CompletionLineState.Verified
+                ? $"Verified in Tempo · {coverage.Entry!.Seconds / 60}m" : $"Manually attested · {coverage.Entry!.Seconds / 60}m";
         }
+        if (completionDay.HasEarlierPending(line, Mode))
+            return "Earlier send unconfirmed · check Tempo status";
+        if (attempt?.State == TempoAttemptState.Pending)
+            return "Send unconfirmed · Tempo status unknown";
+        if (attempt?.State == TempoAttemptState.ReadFailed)
+            return "Tempo status unknown · " + attempt.Reason;
+        if (attempt?.State == TempoAttemptState.Refused)
+            return "Tempo refused · " + attempt.Reason;
+        if (attempt?.State == TempoAttemptState.RemoteConflict)
+            return "Reconcile Tempo time · " + attempt.Reason;
         if (line.AllocationIds.All(approvedIds.Contains))
             return !WasHandedOff(line) ? "Approved" : handoffKeys.Contains(line.ApprovalKey(Mode))
                 ? "Copied or exported · mark entered" : "Changed since copy · copy again";
@@ -371,6 +732,8 @@ internal sealed partial class ReviewWindow
 
     private void MarkEntered()
     {
+        if (TempoBusy)
+            return;
         var day = Day;
         var mode = Mode;
         if (tabs.SelectedIndex == 1 && WorklogAt(worklogs.CurrentRow?.Index ?? -1) is ManualEntry old)
@@ -384,6 +747,18 @@ internal sealed partial class ReviewWindow
         if (selected.Length == 0 || selected.Any(line => !line.AllocationIds.All(approvedIds.Contains)))
         {
             Notify("Select one or more fully approved worklogs.");
+            return;
+        }
+        var confirmedHandoffs = store.ConfirmedHandoffKeys(day).ToHashSet(StringComparer.Ordinal);
+        if (selected.Any(line => completionDay.HasEarlierPending(line, mode)))
+        {
+            Notify("Check the earlier unconfirmed worklog before marking this time entered.");
+            return;
+        }
+        if (selected.Any(line => completionDay.Attempts.GetValueOrDefault(line.ApprovalKey(mode))?.RequiresManualHandoff == true &&
+            !confirmedHandoffs.Contains(line.ApprovalKey(mode))))
+        {
+            Notify("Tempo refused this line. Use Check Tempo status, or copy and enter it before marking it entered.");
             return;
         }
         var changed = selected.FirstOrDefault(line => coverages[line].Entry == null && coverages[line].Consolidated == null &&
@@ -411,8 +786,16 @@ internal sealed partial class ReviewWindow
             if (coverage.Consolidated is { } prior)
                 replaced.UnionWith(prior.Select(item => item.Id));
             var knownId = batch != null ? batch[line.Issue].Id : coverage.Entry?.Id;
+            if (completionDay.States[line] is CompletionLineState.Verified or CompletionLineState.Attested)
+                continue;
             records.Add(new ManualEntry(knownId ?? Guid.NewGuid().ToString("N"), line.Issue, Mode,
-                line.ProposedSeconds, line.AllocationIds.ToArray(), line.Start, line.Intervals.ToArray(), line.Description));
+                line.ProposedSeconds, line.AllocationIds.ToArray(), line.Start, line.Intervals.ToArray(), line.Description,
+                SubmissionProvenance.Manual, app.CompletionNow));
+        }
+        if (records.Count == 0)
+        {
+            Notify("The selected worklogs are already recorded as entered.");
+            return;
         }
         var summary = string.Join("\n", records.Take(6).Select(item =>
             $"{item.Issue} · {LocalStart(item.Start!.Value)} · {item.Seconds / 60}m"));
@@ -429,7 +812,8 @@ internal sealed partial class ReviewWindow
             return;
         try
         {
-            store.SaveManualEntries(day, records, replaced);
+            store.SaveManualEntries(day, records, replaced, selected.Select(line => line.ApprovalKey(mode)).ToArray());
+            app.CompletionSubmission(day, SubmissionProvenance.Manual, records.Count);
             Reload();
             Notify("Recorded locally. No change was made in Tempo.");
         }
@@ -515,7 +899,8 @@ internal sealed partial class ReviewWindow
                 return;
             try
             {
-                store.SaveManualEntry(Day, ManualLedger.KeepSeparate(old));
+                store.SaveManualEntry(Day, ManualLedger.KeepSeparate(old) with { Provenance = SubmissionProvenance.Manual,
+                    RecordedAtUtc = app.CompletionNow });
                 dialog.DialogResult = DialogResult.OK;
             }
             catch (Microsoft.Data.Sqlite.SqliteException)

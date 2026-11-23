@@ -1,7 +1,10 @@
 namespace WorklogDesk.Core;
 
+public enum SubmissionProvenance { Manual, VerifiedTempo }
+
 public sealed record ManualEntry(string Id, string Issue, RoundingMode Mode, int Seconds, string[] AllocationIds,
-    DateTimeOffset? Start = null, WorkInterval[]? Intervals = null, string Description = "");
+    DateTimeOffset? Start = null, WorkInterval[]? Intervals = null, string Description = "",
+    SubmissionProvenance? Provenance = null, DateTimeOffset? RecordedAtUtc = null);
 
 public sealed record ManualCoverage(ManualEntry? Entry, bool NeedsReview, IReadOnlyList<ManualEntry>? Consolidated = null)
 {

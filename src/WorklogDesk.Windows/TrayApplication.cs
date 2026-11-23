@@ -3,7 +3,7 @@ using WorklogDesk.Core;
 
 namespace WorklogDesk.Windows;
 
-internal sealed class TrayApplication : ApplicationContext
+internal sealed partial class TrayApplication : ApplicationContext
 {
     private readonly WorkStore store;
     private readonly WindowsObserver observer;
@@ -30,13 +30,13 @@ internal sealed class TrayApplication : ApplicationContext
 
     public Preferences Settings { get; private set; }
     public TimeZoneInfo Zone { get; }
-    public DateOnly Today => Timeline.DayOf(DateTimeOffset.UtcNow, Zone);
+    public DateOnly Today => completion?.Today ?? Timeline.DayOf(DateTimeOffset.UtcNow, Zone);
     public bool RunningManual => manual != null;
     public bool IsDemo => demo;
     public JiraIssueCache JiraIssues { get; } = new();
 
     public TrayApplication(string folder, bool demo, string instance, bool showOnStart = true, bool diagnostics = false,
-        bool syntheticIdle = false)
+        bool syntheticIdle = false, TimeProvider? clock = null, bool syntheticNotifications = false, bool suppressSyntheticBanner = false)
     {
         this.demo = demo;
         this.syntheticIdle = syntheticIdle;
@@ -72,26 +72,33 @@ internal sealed class TrayApplication : ApplicationContext
         {
             if (key == 1) ShowReview();
             if (key == 2) EditPin();
-            if (key == 3) QuickRequest();
+            if (key == 3) NewJiraTask();
         };
         capture.IdleThreshold = TimeSpan.FromMinutes(Settings.IdleMinutes);
         var menu = new ContextMenuStrip();
+        menu.Items.Add("Finish today’s worklog", null, (_, _) => ShowCompletion());
         menu.Items.Add("Open review   Ctrl+Shift+Alt+L", null, (_, _) => ShowReview());
         menu.Items.Add("Pin task   Ctrl+Shift+Alt+P", null, (_, _) => EditPin());
-        menu.Items.Add("Note a request (no ticket yet)   Ctrl+Shift+Alt+N", null, (_, _) => QuickRequest());
+        menu.Items.Add("New Jira task…   Ctrl+Shift+Alt+N", null, (_, _) => NewJiraTask());
         menu.Items.Add("Assign last RDP span", null, (_, _) => ShowReview(selectRemote: true));
         menu.Items.Add("Start / stop manual timer", null, (_, _) => ToggleManual());
         captureMenu = new ToolStripMenuItem("", null, (_, _) => ToggleCapture());
         menu.Items.Add(captureMenu);
         menu.Items.Add("Settings", null, (_, _) => EditSettings());
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Exit Worklog Desk", null, (_, _) => ExitThread());
+        menu.Items.Add("Exit Worklog Desk", null, (_, _) =>
+        {
+            if (review?.TempoBusy == true)
+                return;
+            ExitThread();
+        });
         tray = new NotifyIcon { Icon = SystemIcons.Application, Visible = !diagnostics, ContextMenuStrip = menu };
         tray.MouseDoubleClick += (_, _) => ShowReview();
 
         tick = new System.Windows.Forms.Timer { Interval = 5_000 };
         tick.Tick += (_, _) => Tick();
         _ = dispatcher.Handle;
+        StartCompletion(clock ?? TimeProvider.System, diagnostics, folder, syntheticNotifications, suppressSyntheticBanner);
         if (!diagnostics)
             _ = Listen(instance, listenerCancellation.Token);
         Sample();
@@ -210,16 +217,51 @@ internal sealed class TrayApplication : ApplicationContext
         UpdateStatus();
     }
 
-    public void QuickRequest()
+    /// <summary>
+    /// Opens the create window in a searched project. Returns the new issue, already assigned to the user, or null.
+    /// </summary>
+    public JiraIssue? CreateJiraIssue(IWin32Window? owner, string summary) => CreateJiraIssue(owner, summary, null);
+
+    internal JiraIssue? CreateJiraIssue(IWin32Window? owner, string summary, string? assistedDescription)
     {
-        using var dialog = new TaskDialog("Note a request without a ticket", new TaskLabel(pin?.Client ?? ""),
-            requireDescription: true, allowStart: true);
-        if (dialog.ShowDialog(review) != DialogResult.OK)
+        JiraCatalog? catalog = null;
+        if (!demo)
+        {
+            try { catalog = OpenCatalog(); }
+            catch (InvalidOperationException error)
+            {
+                MessageBox.Show(owner, error.Message, "New Jira task", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return null;
+            }
+        }
+        using (catalog)
+        {
+            var preferred = new[] { Settings.LastProject }.Concat(JiraSettings.ProjectKeys(Settings.Jira?.Projects ?? ""))
+                .Where(key => !string.IsNullOrEmpty(key)).Distinct(StringComparer.Ordinal).ToArray();
+            using var dialog = new CreateIssueDialog(catalog, summary, preferred, assistedDescription);
+            if (owner == null)
+            {
+                dialog.StartPosition = FormStartPosition.CenterScreen;
+                dialog.ShowInTaskbar = true;
+                dialog.TopMost = true;
+            }
+            if (dialog.ShowDialog(owner) != DialogResult.OK || dialog.NewIssue is not { } issue)
+                return null;
+            SaveSettings(Settings with { LastProject = dialog.ProjectKey });
+            JiraIssues.Clear();
+            return issue;
+        }
+    }
+
+    /// <summary>From the tray or Ctrl+Shift+Alt+N: create a task when a colleague asks for something without one.</summary>
+    public void NewJiraTask()
+    {
+        if (CreateJiraIssue(null, "") is not { } issue)
             return;
-        store.SaveRequest(new RequestDraft(Guid.NewGuid().ToString("N"), Today, dialog.Task));
-        if (dialog.StartTimer)
-            StartManual(dialog.Task);
-        review?.Reload();
+        try { Clipboard.SetText(issue.Key); }
+        catch (System.Runtime.InteropServices.ExternalException) { }
+        tray.ShowBalloonTip(5000, $"Created {issue.Key}", $"{issue.Summary}\nThe key is on your clipboard and the issue is in your assign list.",
+            ToolTipIcon.Info);
     }
 
     public void ToggleManual()
@@ -241,9 +283,26 @@ internal sealed class TrayApplication : ApplicationContext
 
     public void EditSettings()
     {
-        using var dialog = new SettingsDialog(Settings);
+        if (review?.TempoBusy == true)
+            return;
+        using var dialog = new SettingsDialog(Settings, StartupRegistration.IsEnabled(), canStartWithWindows: !demo);
         if (dialog.ShowDialog(review) != DialogResult.OK)
             return;
+        if (!demo && dialog.StartWithWindows != StartupRegistration.IsEnabled())
+        {
+            try
+            {
+                if (dialog.StartWithWindows)
+                    StartupRegistration.Enable(Application.ExecutablePath);
+                else
+                    StartupRegistration.Disable();
+            }
+            catch (Exception error) when (error is UnauthorizedAccessException or System.Security.SecurityException or IOException)
+            {
+                MessageBox.Show(review, "Windows didn't allow changing the startup setting: " + error.Message, "Worklog Desk",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
         var themeChanged = dialog.Result.Theme != Settings.Theme;
         Apply(dialog.Result);
         if (!themeChanged)
@@ -275,8 +334,43 @@ internal sealed class TrayApplication : ApplicationContext
 
     private void SaveSettings(Preferences settings)
     {
+        if (settings.Rounding != Settings.Rounding)
+            ObserveCompletionCutoff();
         store.SavePreferences(settings);
         Settings = settings;
+    }
+
+    public ITempoGateway OpenTempo()
+    {
+        if (Settings.Jira is not { } config)
+            throw new InvalidOperationException("Connect Jira first. Tempo needs it to find your account and the issue IDs.");
+        var token = Settings.Tempo ? CredentialVault.Read(config.TempoCredentialTarget) : null;
+        if (string.IsNullOrEmpty(token))
+            throw new InvalidOperationException("Connect Tempo first.");
+        var jira = OpenCatalog() ?? throw new InvalidOperationException("Connect Jira first.");
+        try { return new TempoGateway(jira, new TempoClient(token)); }
+        catch
+        {
+            jira.Dispose();
+            throw;
+        }
+    }
+
+    public void ConnectTempo()
+    {
+        if (Settings.Jira is not { } config)
+        {
+            MessageBox.Show(review, "Connect Jira first. Tempo uses it to find your account and issue IDs.", "Connect Tempo",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        using var dialog = new TempoConfigDialog(config, Settings.Tempo, () => OpenCatalog()!);
+        if (dialog.ShowDialog(review) != DialogResult.OK)
+            return;
+        if (!dialog.Connected)
+            CredentialVault.Delete(config.TempoCredentialTarget);
+        SaveSettings(Settings with { Tempo = dialog.Connected });
+        review?.UpdateConnections();
     }
 
     public JiraCatalog? OpenCatalog()
@@ -293,6 +387,7 @@ internal sealed class TrayApplication : ApplicationContext
     protected override void ExitThreadCore()
     {
         tick.Stop();
+        StopCompletion();
         listenerCancellation.Cancel();
         observer.Observed -= capture.Observe;
         var now = Environment.TickCount64;
@@ -452,8 +547,13 @@ internal sealed class TrayApplication : ApplicationContext
         review?.SetStatus(state, pinPaused ? null : pin, observer.HotkeysAvailable, interruptedManual != null, pinPaused);
     }
 
-    private void ShowReview(bool selectRemote = false)
+    private void ShowReview(bool selectRemote = false, DateOnly? completionDate = null)
     {
+        if (review?.TempoBusy == true)
+        {
+            review.Activate();
+            return;
+        }
         Flush(true);
         if (review is null || review.IsDisposed)
         {
@@ -462,16 +562,25 @@ internal sealed class TrayApplication : ApplicationContext
         }
         if (!review.Visible)
             review.Show();
+        // A hidden process launch can suppress the first native ShowWindow call while WinForms marks the form visible.
+        if (!review.IsShown)
+        {
+            review.Hide();
+            review.Show();
+        }
         if (review.WindowState == FormWindowState.Minimized)
             review.WindowState = FormWindowState.Normal;
         review.Activate();
         observer.Sample();
         Flush(true);
         review.Reload();
+        if (completionDate is { } target)
+            review.OpenCompletionDate(target);
         reviewDirty = false;
         if (selectRemote)
             review.SelectLastRemote();
         UpdateStatus();
+        completion?.ReviewOpened(review.SelectedDay);
     }
 
     private async Task Listen(string instance, CancellationToken cancellation)

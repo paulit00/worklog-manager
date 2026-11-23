@@ -5,7 +5,12 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $root = Join-Path $PSScriptRoot ".."
-if (-not $Exe) { $Exe = Join-Path $root "src/WorklogDesk.Windows/bin/Release/net10.0-windows/WorklogDesk.Windows.exe" }
+if (-not $Exe) {
+    $project = Join-Path $root "src/WorklogDesk.Windows/WorklogDesk.Windows.csproj"
+    $target = dotnet msbuild $project -nologo -property:Configuration=Release -getProperty:TargetPath
+    if ($LASTEXITCODE -ne 0) { throw "Could not resolve the Worklog Desk Release executable." }
+    $Exe = [IO.Path]::ChangeExtension(($target -join "`n").Trim(), ".exe")
+}
 if (-not $Output) { $Output = Join-Path $root "artifacts/measurement" }
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
 $directory = New-Item -ItemType Directory -Path $Output -Force

@@ -201,14 +201,20 @@ internal sealed class SettingsDialog : Form
 
     public Preferences Result { get; private set; }
 
-    public SettingsDialog(Preferences preferences)
+    private readonly CheckBox startup = new() { Text = "Start Worklog Desk when I sign in to Windows", AutoSize = true };
+
+    public bool StartWithWindows => startup.Checked;
+
+    public SettingsDialog(Preferences preferences, bool startWithWindows = false, bool canStartWithWindows = false)
     {
+        startup.Checked = startWithWindows;
+        startup.Enabled = canStartWithWindows;
         Result = preferences;
         Text = "Worklog Desk settings";
         Font = SystemFonts.MessageBoxFont ?? SystemFonts.DefaultFont;
         AutoScaleMode = AutoScaleMode.Dpi;
-        MinimumSize = new Size(700, 550);
-        Size = new Size(780, 590);
+        MinimumSize = new Size(700, 580);
+        Size = new Size(780, 620);
         StartPosition = FormStartPosition.CenterParent;
         ShowInTaskbar = false;
         var layout = Ui.DialogLayout();
@@ -228,6 +234,7 @@ internal sealed class SettingsDialog : Form
         Ui.Field(layout, "", communications);
         Ui.Field(layout, "Automatic", titles);
         Ui.Field(layout, "Appearance", theme);
+        Ui.Field(layout, "Startup", startup);
         Ui.Field(layout, "Idle cutoff (minutes)", idle);
         Ui.Field(layout, "Daily target (minutes)", target);
         Ui.Field(layout, "Workday timezone", new Label { Text = preferences.TimeZoneId, AutoSize = true });

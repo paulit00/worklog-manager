@@ -7,11 +7,6 @@ internal sealed partial class ReviewWindow
 {
     private void EditSelected()
     {
-        if (tabs.SelectedIndex == 2)
-        {
-            EditRequest();
-            return;
-        }
         var selection = Selected();
         if (selection.Length > 1)
         {
@@ -63,7 +58,8 @@ internal sealed partial class ReviewWindow
         }
         else
         {
-            using var dialog = new AssignDialog(caption, initial, IssueChoices(selected), app.JiraIssues, app.OpenCatalog, app.IsDemo);
+            using var dialog = new AssignDialog(caption, initial, IssueChoices(selected), app.JiraIssues, app.OpenCatalog, app.IsDemo,
+            createIssue: app.CreateJiraIssue);
             if (dialog.ShowDialog(this) != DialogResult.OK)
                 return;
             choice = dialog.Choice;
@@ -131,6 +127,45 @@ internal sealed partial class ReviewWindow
         Notify($"Assigned {targets.Length} row(s), {minutes}, to their suggested issues. Ctrl+Z undoes it.");
     }
 
+    private void OpenAssistedReview()
+    {
+        if (TempoBusy)
+            return;
+        var date = Day;
+        using var dialog = new AssistedReviewDialog(app, date, store.Rows(date), assignments =>
+        {
+            var original = assignments.SelectMany(item => item.Group.Rows).ToArray();
+            var changes = assignments.SelectMany(item => item.Group.Rows.Select(row => row with
+            {
+                Status = Disposition.Billable,
+                Task = row.Task with
+                {
+                    Issue = item.Task.Issue,
+                    Client = row.Task.Client.Length > 0 ? row.Task.Client : item.Task.Client,
+                    Description = row.Task.Description.Length > 0 ? row.Task.Description : item.Task.Description
+                }
+            })).ToArray();
+            return SaveAssisted(date, original, changes);
+        });
+        dialog.ShowDialog(this);
+    }
+
+    private string? SaveAssisted(DateOnly date, Allocation[] original, Allocation[] changes)
+    {
+        if (date != Day || TempoBusy)
+            return "The reviewed date or Tempo operation changed. Open Suggestions again.";
+        try
+        {
+            store.ReplaceRows([], changes, original);
+            undo.Push(new UndoStep(date, [], original, "suggested assignments", changes));
+            undoButton.Enabled = true;
+            Reload();
+            return null;
+        }
+        catch (InvalidOperationException error) { return error.Message; }
+        catch (Microsoft.Data.Sqlite.SqliteException) { return "Local storage could not save the assignment. Try again."; }
+    }
+
     private void ClassifySelected(Disposition disposition, Allocation[]? rowsToChange = null)
     {
         var selected = rowsToChange ?? Selected();
@@ -144,45 +179,6 @@ internal sealed partial class ReviewWindow
             disposition == Disposition.Internal ? "marking internal" : "excluding");
     }
 
-    private void LinkRequest()
-    {
-        if (requests.CurrentRow?.Tag is not RequestDraft draft)
-        {
-            Notify("Select a saved request first.");
-            return;
-        }
-        using var dialog = new AssignDialog("Link request to a Jira issue", draft.Task, IssueChoices([]), app.JiraIssues,
-            app.OpenCatalog, app.IsDemo, allowClassify: false);
-        if (dialog.ShowDialog(this) != DialogResult.OK || !TaskLabel.ValidIssue(dialog.Result.Issue))
-            return;
-        store.SaveRequest(draft with { Task = dialog.Result });
-        Reload();
-        Notify($"Linked request to {dialog.Result.Issue}.");
-    }
-
-    private void OpenJiraForm()
-    {
-        if (requests.CurrentRow?.Tag is not RequestDraft draft || app.Settings.Jira is not { } config || app.IsDemo)
-        {
-            Notify("Select a request and connect Jira Cloud to open its create form.");
-            return;
-        }
-        try
-        {
-            Process.Start(new ProcessStartInfo(new Uri(new Uri(config.Site), "secure/CreateIssue!default.jspa").AbsoluteUri)
-            {
-                UseShellExecute = true
-            });
-            Notify($"Create the ticket in Jira, then link its key to the saved request.");
-            if (MessageBox.Show(this, "Copy this request summary to your clipboard?", "Jira draft",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
-                Clipboard.SetText(draft.Task.Description);
-        }
-        catch (Exception error) when (error is System.ComponentModel.Win32Exception or System.Runtime.InteropServices.ExternalException)
-        {
-            Notify("Could not open Jira or access the clipboard.");
-        }
-    }
 
     private void ApproveSelected() => ApproveRows(Selected());
 
@@ -292,19 +288,5 @@ internal sealed partial class ReviewWindow
         Save(selected.Select(row => row.Id).ToArray(), [merged]);
     }
 
-    private void EditRequest()
-    {
-        if (requests.CurrentRow?.Tag is not RequestDraft draft)
-        {
-            Notify("Select a request draft first.");
-            return;
-        }
-        using var dialog = new TaskDialog("Edit request or link Jira issue", draft.Task, requireDescription: true);
-        if (dialog.ShowDialog(this) == DialogResult.OK)
-        {
-            store.SaveRequest(draft with { Task = dialog.Task });
-            Reload();
-        }
-    }
 
 }

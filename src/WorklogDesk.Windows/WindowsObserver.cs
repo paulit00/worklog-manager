@@ -15,6 +15,7 @@ internal sealed class WindowsObserver : NativeWindow, IDisposable
     private const uint ShortcutModifiers = 0x4007; // Alt+Ctrl+Shift, without auto-repeat.
     private readonly WinEventCallback callback;
     private readonly nint hook;
+    private readonly nint powerRegistration;
     private readonly bool notifications;
     private bool locked;
     private bool suspended;
@@ -28,6 +29,7 @@ internal sealed class WindowsObserver : NativeWindow, IDisposable
     public event Action? SessionInterrupted;
     public event Action? SessionBoundaryObserved;
     public event Action? SessionResumed;
+    public event Action? CompletionClockChanged;
     public event Action? PinConflict;
     public Func<Preferences>? Preferences { get; init; }
     public Func<TaskLabel?, TaskLabel?>? Pin { get; init; }
@@ -35,10 +37,14 @@ internal sealed class WindowsObserver : NativeWindow, IDisposable
     public bool SessionNotificationsAvailable => notifications;
     public bool HotkeysAvailable { get; }
 
+    public bool CanRequestCompletionCue => notifications && !locked && !suspended && !ending && IsCurrentSessionInteractive();
+    public bool IsSuspended => suspended || ending;
+
     public WindowsObserver(bool registerShortcuts)
     {
         CreateHandle(new CreateParams { Caption = "Worklog Desk capture" });
         notifications = WTSRegisterSessionNotification(Handle, 0);
+        powerRegistration = RegisterSuspendResumeNotification(Handle, 0); // DEVICE_NOTIFY_WINDOW_HANDLE
         callback = OnForeground;
         hook = SetWinEventHook(ForegroundEvent, ForegroundEvent, 0, callback, 0, 0, 0);
         var review = registerShortcuts && RegisterHotKey(Handle, 1, ShortcutModifiers, (uint)Keys.L);
@@ -89,6 +95,7 @@ internal sealed class WindowsObserver : NativeWindow, IDisposable
                     Sample();
                     if (!locked && !suspended)
                         SessionResumed?.Invoke();
+                    CompletionClockChanged?.Invoke();
                 }
                 break;
             case WmHotkey:
@@ -112,6 +119,7 @@ internal sealed class WindowsObserver : NativeWindow, IDisposable
                     if (!suspended && !ending)
                         SessionResumed?.Invoke();
                 }
+                CompletionClockChanged?.Invoke();
                 break;
             case WmPowerBroadcast:
                 if ((int)message.WParam is 4 or 6 or 7 or 18)
@@ -124,10 +132,42 @@ internal sealed class WindowsObserver : NativeWindow, IDisposable
                         SessionBoundaryObserved?.Invoke();
                     else if (!locked && !ending)
                         SessionResumed?.Invoke();
+                    CompletionClockChanged?.Invoke();
+                    message.Result = 1;
+                    return;
                 }
+                break;
+            case 0x001E: // WM_TIMECHANGE
+                CompletionClockChanged?.Invoke();
                 break;
         }
         base.WndProc(ref message);
+    }
+
+    private static bool IsCurrentSessionInteractive()
+    {
+        const int connectState = 8;
+        if (!WTSQuerySessionInformation(0, -1, connectState, out var state, out var bytes))
+            return false;
+        try
+        {
+            if (bytes < sizeof(int) || Marshal.ReadInt32(state) != 0) // WTSActive
+                return false;
+        }
+        finally { WTSFreeMemory(state); }
+
+        const uint readDesktopObjects = 1;
+        const int objectName = 2;
+        var desktop = OpenInputDesktop(0, false, readDesktopObjects);
+        if (desktop == 0)
+            return false;
+        try
+        {
+            var name = new StringBuilder(64);
+            return GetUserObjectInformation(desktop, objectName, name, name.Capacity * sizeof(char), out _) &&
+                string.Equals(name.ToString(), "Default", StringComparison.OrdinalIgnoreCase);
+        }
+        finally { CloseDesktop(desktop); }
     }
 
     public void Dispose()
@@ -141,6 +181,8 @@ internal sealed class WindowsObserver : NativeWindow, IDisposable
             UnregisterHotKey(Handle, id);
         if (notifications)
             WTSUnRegisterSessionNotification(Handle);
+        if (powerRegistration != 0)
+            UnregisterSuspendResumeNotification(powerRegistration);
         DestroyHandle();
     }
 
@@ -315,4 +357,13 @@ internal sealed class WindowsObserver : NativeWindow, IDisposable
     [DllImport("user32.dll")] private static extern bool UnregisterHotKey(nint window, int id);
     [DllImport("wtsapi32.dll")] private static extern bool WTSRegisterSessionNotification(nint window, uint flags);
     [DllImport("wtsapi32.dll")] private static extern bool WTSUnRegisterSessionNotification(nint window);
+    [DllImport("wtsapi32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool WTSQuerySessionInformation(nint server, int session, int infoClass, out nint buffer, out int bytes);
+    [DllImport("wtsapi32.dll")] private static extern void WTSFreeMemory(nint buffer);
+    [DllImport("user32.dll")] private static extern nint OpenInputDesktop(uint flags, bool inherit, uint access);
+    [DllImport("user32.dll")] private static extern bool CloseDesktop(nint desktop);
+    [DllImport("user32.dll")] private static extern nint RegisterSuspendResumeNotification(nint recipient, uint flags);
+    [DllImport("user32.dll")] private static extern bool UnregisterSuspendResumeNotification(nint registration);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool GetUserObjectInformation(nint desktop, int index, StringBuilder buffer, int length, out int needed);
 }

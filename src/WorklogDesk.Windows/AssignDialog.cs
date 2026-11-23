@@ -59,9 +59,13 @@ internal sealed class AssignDialog : Form
     public TaskLabel Result { get; private set; }
     public Disposition Choice { get; private set; } = Disposition.Billable;
 
+    private readonly Func<IWin32Window, string, JiraIssue?>? createIssue;
+
     public AssignDialog(string caption, TaskLabel initial, IReadOnlyList<IssueChoice> local, JiraIssueCache cache,
-        Func<JiraCatalog?> openCatalog, bool demo, bool allowClassify = true)
+        Func<JiraCatalog?> openCatalog, bool demo, bool allowClassify = true,
+        Func<IWin32Window, string, JiraIssue?>? createIssue = null)
     {
+        this.createIssue = createIssue;
         this.initial = initial;
         this.local = local;
         this.cache = cache;
@@ -121,6 +125,12 @@ internal sealed class AssignDialog : Form
         {
             actions.Controls.Add(Ui.Button("Exclude", (_, _) => Accept(Disposition.Excluded), 86));
             actions.Controls.Add(Ui.Button("Internal", (_, _) => Accept(Disposition.Internal), 86));
+        }
+        if (createIssue != null)
+        {
+            var spacer = new Panel { Width = 40, Height = 1 };
+            actions.Controls.Add(spacer);
+            actions.Controls.Add(Ui.Button("New Jira task…", (_, _) => CreateIssue(), 130));
         }
         layout.Controls.Add(actions, 0, 5);
         layout.SetColumnSpan(actions, 2);
@@ -330,6 +340,23 @@ internal sealed class AssignDialog : Form
         var text = item.Description.Length > 0 ? item.Description : item.Where == "Typed" ? "" : item.Summary;
         if (text.Length > 0 && (description.Text.Length == 0 || description.Text == autoDescription))
             description.Text = autoDescription = text;
+    }
+
+    // Creates the task in Jira (assigned to the user) and assigns the selected time to it straight away.
+    private void CreateIssue()
+    {
+        var typed = search.Text.Trim();
+        var title = description.Text.Trim().Length > 0 ? description.Text.Trim() : TaskLabel.ValidIssue(typed.ToUpperInvariant()) ? "" : typed;
+        if (createIssue?.Invoke(this, title) is not { } issue)
+            return;
+        cache.Clear();
+        search.Text = issue.Key; // Clears earlier results; the new issue is listed next.
+        found = [new IssueChoice(issue.Key, issue.Summary, "Created")];
+        Refill();
+        Select(0);
+        if (description.Text.Trim().Length == 0)
+            description.Text = issue.Summary;
+        Accept(Disposition.Billable);
     }
 
     private void Accept(Disposition choice)

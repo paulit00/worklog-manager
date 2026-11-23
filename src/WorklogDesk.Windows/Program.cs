@@ -9,6 +9,15 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--mcp")
+        {
+            Environment.ExitCode = WorklogMcp.Run(args[1..]);
+            return;
+        }
+        // Only the running tray session can accept a notification token. A COM-launched stale toast must never
+        // run normal startup or send the unconditional open-review message to a different instance.
+        if (IsColdNotificationActivation(args))
+            return;
         ApplicationConfiguration.Initialize();
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, _) =>
@@ -71,6 +80,9 @@ internal static class Program
                 mutex.ReleaseMutex();
         }
     }
+
+    internal static bool IsColdNotificationActivation(IEnumerable<string> args) =>
+        args.Any(arg => arg.StartsWith("----AppNotificationActivated:", StringComparison.Ordinal));
 
     private static void ShowExisting(string instance)
     {

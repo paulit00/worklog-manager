@@ -12,18 +12,21 @@ internal sealed record Preferences(
     bool Recording = false, bool Browser = false, bool Developer = true, bool Remote = true,
     bool Communications = false, int IdleMinutes = 2, int WorkdayMinutes = 480,
     string TimeZoneId = "", RoundingMode Rounding = RoundingMode.IssueDay,
-    SourceMapping[]? Mappings = null, JiraSettings? Jira = null, bool WindowTitles = true, string Theme = "Dark");
+    SourceMapping[]? Mappings = null, JiraSettings? Jira = null, bool WindowTitles = true, string Theme = "Dark",
+    bool Tempo = false, string LastProject = "", CompletionReminder? CompletionReminder = null);
 
 internal sealed record RequestDraft(string Id, DateOnly Day, TaskLabel Task);
 internal sealed record ExportReceipt(string Issue, WorkInterval[] Intervals);
 
-internal sealed class WorkStore : IDisposable
+internal sealed partial class WorkStore : IDisposable
 {
     private readonly SqliteConnection connection;
     private const int SchemaVersion = 5;
     private const int ContextRetentionDays = 30;
     private readonly Dictionary<TaskLabel, string> knownTasks = [];
     private readonly Dictionary<string, string> knownContexts = new(StringComparer.Ordinal);
+    public long CompletionRevision { get; private set; }
+    public event Action? CompletionChanging;
 
     public WorkStore(string folder, bool inMemory = false)
     {
@@ -123,6 +126,8 @@ internal sealed class WorkStore : IDisposable
 
     public void SaveCapture(IReadOnlyList<WorkSpan> spans, IReadOnlyList<WorkSpan> checkpoint, TimeZoneInfo zone)
     {
+        if (spans.Count > 0)
+            CompletionChanging?.Invoke();
         using var transaction = connection.BeginTransaction();
         var taskIds = new Dictionary<TaskLabel, string>();
         foreach (var span in spans)
@@ -142,10 +147,14 @@ internal sealed class WorkStore : IDisposable
         }
         Save("checkpoint", checkpoint, transaction);
         transaction.Commit();
+        if (spans.Count > 0)
+            CompletionRevision++;
         RememberTasks(taskIds);
     }
 
-    public List<Allocation> Rows(DateOnly day)
+    public List<Allocation> Rows(DateOnly day) => Rows(day, null);
+
+    private List<Allocation> Rows(DateOnly day, SqliteTransaction? transaction)
     {
         using var command = Command("""
             SELECT a.id,a.started,a.ended,a.app,a.kind,a.status,a.approved,t.id,t.payload,a.approved_mode,a.approved_key,
@@ -153,7 +162,7 @@ internal sealed class WorkStore : IDisposable
             FROM allocation a LEFT JOIN task t ON a.task_id=t.id LEFT JOIN context c ON a.context_id=c.id
             WHERE day=$day ORDER BY started,a.id
             """,
-            null, ("$day", FormatDay(day)));
+            transaction, ("$day", FormatDay(day)));
         using var reader = command.ExecuteReader();
         var rows = new List<Allocation>();
         var tasks = new Dictionary<string, TaskLabel>(StringComparer.Ordinal);
@@ -196,23 +205,54 @@ internal sealed class WorkStore : IDisposable
         return days;
     }
 
-    public void ReplaceRows(IReadOnlyCollection<string> removed, IReadOnlyCollection<Allocation> updated)
+    public DateOnly[] CompletionDatesBefore(DateOnly day)
     {
+        using var command = Command("""
+            SELECT day FROM allocation WHERE day<$day
+            UNION SELECT day FROM manual_tempo WHERE day<$day
+            UNION SELECT substr(name,-10) AS day FROM setting
+                WHERE (name GLOB 'tempo-attempts-*' OR name GLOB 'tempo-pending-*') AND substr(name,-10)<$day
+            ORDER BY day DESC
+            """, null, ("$day", FormatDay(day)));
+        using var reader = command.ExecuteReader();
+        var days = new List<DateOnly>();
+        while (reader.Read())
+            days.Add(DateOnly.ParseExact(reader.GetString(0), "yyyy-MM-dd", CultureInfo.InvariantCulture));
+        return days.ToArray();
+    }
+
+    public CompletionDay Completion(DateOnly day, RoundingMode mode, bool inProgress = false) =>
+        new(Rows(day), ManualEntries(day), mode, TempoAttempts(day), inProgress);
+
+    public void ReplaceRows(IReadOnlyCollection<string> removed, IReadOnlyCollection<Allocation> updated,
+        IReadOnlyCollection<Allocation>? expectedAssistedRows = null)
+    {
+        CompletionChanging?.Invoke();
         if (updated.Any(row => row.End <= row.Start))
             throw new InvalidOperationException("The end time must follow the start time.");
         using var transaction = connection.BeginTransaction();
+        if (expectedAssistedRows != null)
+        {
+            if (removed.Count != 0)
+                throw new InvalidOperationException("Assisted review can only assign or undo an assignment for unapproved recorded activity.");
+            CheckAssistedEdit(expectedAssistedRows, updated, transaction);
+        }
         var taskIds = new Dictionary<TaskLabel, string>();
         foreach (var id in removed)
         {
             using var delete = Command("DELETE FROM allocation WHERE id=$id", transaction, ("$id", id));
             delete.ExecuteNonQuery();
         }
-        foreach (var row in updated)
+        try
         {
-            if (row.Status is Disposition.Billable or Disposition.Internal && HasAssignedOverlap(row, transaction))
-                throw new InvalidOperationException("This interval overlaps time already assigned to a task.");
-            SaveAllocation(row, transaction, taskIds);
+            foreach (var row in updated)
+            {
+                if (row.Status is Disposition.Billable or Disposition.Internal && HasAssignedOverlap(row, transaction))
+                    throw new InvalidOperationException("This interval overlaps time already assigned to a task.");
+                SaveAllocation(row, transaction, taskIds);
+            }
         }
+        finally { knownContexts.Clear(); }
         using var cleanup = Command("""
             DELETE FROM task WHERE NOT EXISTS (SELECT 1 FROM allocation WHERE task_id=task.id);
             DELETE FROM context WHERE NOT EXISTS (SELECT 1 FROM allocation WHERE context_id=context.id);
@@ -221,12 +261,15 @@ internal sealed class WorkStore : IDisposable
         knownContexts.Clear();
         transaction.Commit();
         knownTasks.Clear();
+        CompletionRevision++;
         RememberTasks(taskIds);
     }
 
-    public List<ManualEntry> ManualEntries(DateOnly day)
+    public List<ManualEntry> ManualEntries(DateOnly day) => ManualEntries(day, null);
+
+    private List<ManualEntry> ManualEntries(DateOnly day, SqliteTransaction? transaction)
     {
-        using var command = Command("SELECT payload FROM manual_tempo WHERE day=$day", null, ("$day", FormatDay(day)));
+        using var command = Command("SELECT payload FROM manual_tempo WHERE day=$day", transaction, ("$day", FormatDay(day)));
         using var reader = command.ExecuteReader();
         var entries = new List<ManualEntry>();
         while (reader.Read())
@@ -237,8 +280,13 @@ internal sealed class WorkStore : IDisposable
     public void SaveManualEntry(DateOnly day, ManualEntry entry)
         => SaveManualEntries(day, [entry]);
 
-    public void SaveManualEntries(DateOnly day, IReadOnlyList<ManualEntry> entries, IReadOnlyCollection<string>? replacedIds = null)
+    public void SaveManualEntries(DateOnly day, IReadOnlyList<ManualEntry> entries,
+        IReadOnlyCollection<string>? replacedIds = null, IReadOnlyCollection<string>? clearAttempts = null)
     {
+        CompletionChanging?.Invoke();
+        var attempts = clearAttempts == null ? null : TempoAttempts(day);
+        foreach (var key in clearAttempts ?? [])
+            attempts!.Remove(key);
         using var transaction = connection.BeginTransaction();
         foreach (var id in replacedIds ?? [])
         {
@@ -254,7 +302,10 @@ internal sealed class WorkStore : IDisposable
                 """, transaction, ("$id", entry.Id), ("$day", FormatDay(day)), ("$payload", Protect(entry)));
             command.ExecuteNonQuery();
         }
+        if (attempts != null)
+            SaveTempoAttempts(day, attempts, transaction);
         transaction.Commit();
+        CompletionRevision++;
     }
 
     public ExportReceipt[] Exports(DateOnly day) => Read<ExportReceipt[]>("export-" + FormatDay(day)) ?? [];
@@ -276,6 +327,36 @@ internal sealed class WorkStore : IDisposable
     public void RecordHandoffKeys(DateOnly day, IEnumerable<string> keys) =>
         Save("handoff-keys-" + FormatDay(day), HandoffKeys(day).Concat(keys).Distinct(StringComparer.Ordinal).ToArray());
 
+    public string[] ConfirmedHandoffKeys(DateOnly day) => Read<string[]>("manual-handoff-" + FormatDay(day)) ?? [];
+    public void ConfirmHandoffKeys(DateOnly day, IEnumerable<string> keys) => Save("manual-handoff-" + FormatDay(day),
+        ConfirmedHandoffKeys(day).Concat(keys).Distinct(StringComparer.Ordinal).ToArray());
+
+    public Dictionary<string, TempoAttempt> TempoAttempts(DateOnly day) =>
+        Read<Dictionary<string, TempoAttempt>>("tempo-attempts-" + FormatDay(day)) ??
+        (Read<string[]>("tempo-pending-" + FormatDay(day)) ?? []).ToDictionary(key => key,
+            _ => new TempoAttempt(TempoAttemptState.Pending), StringComparer.Ordinal);
+
+    public string[] TempoPending(DateOnly day) => TempoAttempts(day)
+        .Where(item => item.Value.State == TempoAttemptState.Pending).Select(item => item.Key).ToArray();
+
+    public void SetTempoAttempt(DateOnly day, string key, TempoAttempt? attempt)
+    {
+        CompletionChanging?.Invoke();
+        var attempts = TempoAttempts(day);
+        if (attempt == null)
+            attempts.Remove(key);
+        else
+            attempts[key] = attempt;
+        SaveTempoAttempts(day, attempts);
+        CompletionRevision++;
+    }
+
+    private void SaveTempoAttempts(DateOnly day, Dictionary<string, TempoAttempt> attempts, SqliteTransaction? transaction = null) =>
+        Save("tempo-attempts-" + FormatDay(day), attempts, transaction);
+
+    public CompletionJournal CompletionJournal() => Read<CompletionJournal>("completion-pilot") ?? new();
+    public void SaveCompletionJournal(CompletionJournal journal) => Save("completion-pilot", journal);
+
     public string[] CorrectionCopies(DateOnly day) => Read<string[]>("correction-" + FormatDay(day)) ?? [];
     public void RestoreCorrectionCopies(DateOnly day, string[] keys) => Save("correction-" + FormatDay(day), keys);
     public void RecordCorrectionCopy(DateOnly day, string key) =>
@@ -283,8 +364,10 @@ internal sealed class WorkStore : IDisposable
 
     public void RemoveManualEntry(string id)
     {
+        CompletionChanging?.Invoke();
         using var command = Command("DELETE FROM manual_tempo WHERE id=$id", null, ("$id", id));
         command.ExecuteNonQuery();
+        CompletionRevision++;
     }
 
     public List<RequestDraft> Requests(DateOnly day)
@@ -379,9 +462,9 @@ internal sealed class WorkStore : IDisposable
             knownTasks[pair.Key] = pair.Value;
     }
 
-    private T? Read<T>(string name)
+    private T? Read<T>(string name, SqliteTransaction? transaction = null)
     {
-        using var command = Command("SELECT value FROM setting WHERE name=$name", null, ("$name", name));
+        using var command = Command("SELECT value FROM setting WHERE name=$name", transaction, ("$name", name));
         return command.ExecuteScalar() is byte[] bytes ? Unprotect<T>(bytes) : default;
     }
 

@@ -4,14 +4,14 @@ Worklog Desk is a Windows tray app for reviewing Business Central DevOps time be
 
 ## Run
 
-Use the Windows **.NET 10 Desktop Runtime**. From the project folder:
+Use the Windows **.NET 10 Desktop Runtime**. The app bundles the Windows App SDK components used for notifications. Keep the build or publish files together when moving the executable. From the project folder:
 
 ```powershell
 dotnet build WorklogDesk.slnx -c Release
 dotnet run --project src/WorklogDesk.Windows -c Release --no-build -- --demo
 ```
 
-The demo uses synthetic activity and a local fake Jira catalog. Remove `--demo` for a personal workspace. On first launch, open **Settings** to choose sources and set your daily target, then select **Start foreground**. **Pause foreground** leaves an explicitly started manual timer running. Closing the review keeps the tray running. Use **Exit Worklog Desk** in the tray to stop the app.
+The demo uses synthetic activity and a local fake Jira catalog. Remove `--demo` for a personal workspace. On first launch, open **Settings** to choose sources and set your daily target, then select **Start recording**. The choice is remembered across restarts. **Pause recording** leaves an explicitly started manual timer running. Tick **Start Worklog Desk when I sign in to Windows** in Settings to have it start with Windows. It registers the exe's current location, so keep the app in one folder. Closing the review keeps the tray running. Use **Exit Worklog Desk** in the tray to stop the app.
 
 ## Automatic attribution
 
@@ -26,7 +26,7 @@ Pinning remains available for long stretches where no window shows a key.
 
 ## The review window
 
-The review is dark by default; change **Appearance** in Settings. Three views sit above the grid: **Activity**, **Worklogs** and **Requests**.
+The review is dark by default; change **Appearance** in Settings. Two views sit above the grid: **Activity** and **Worklogs**.
 
 - **Activity:** select rows, then press **Enter** or double-click, or use **Assign…**. The assign window lists suggested and recent issues and your own open and Waiting for Customer Jira issues, loaded when it opens and cached for 10 minutes. Typing filters them and searches all of Jira, including colleagues' issues. You can also type any key directly. **Internal** and **Exclude** are in the same window. Every selected row is assigned, including rows marked *Check timing*.
 - **Undo** (Ctrl+Z) reverses the last change in the review: assignment, accepted suggestions, approval, classification, edits, split or merge.
@@ -35,20 +35,43 @@ The review is dark by default; change **Appearance** in Settings. Three views si
 ## Review a day
 
 1. Start with **Accept suggestions**, then use **Assign…** for whatever is left. Pinning is optional: pin a task before working across the browser, VS Code and shared RDP. Use **Assign last RDP span** from the tray if you forgot the pin. Browser timing is opt-in and can use a configured Edge title alias where available. In **Settings**, an alias maps a workspace, RDP connection or Edge profile to a client. You can also add an optional standing Jira issue, so that time arrives pre-assigned but still needs approval.
-2. When a colleague asks for something in Teams or Outlook and there's no ticket yet, use **Note a request** (tray, Ctrl+Shift+Alt+N, or **New request** in the Requests view). It saves a one-line note and an optional link, so you can later link it to a Jira issue or open Jira's create form. Start the manual timer for calls or work away from the keyboard.
-3. Assign activity to the right Jira issue, or mark it Internal or Excluded, in the **Assign…** window. In the Requests view, **Link to Jira…** attaches a saved request to an issue after you create the ticket.
+2. When work has no ticket, create one with **New Jira task…**. It's in the Assign window, and in the tray or with Ctrl+Shift+Alt+N when a colleague asks for something. Search for a project, pick the type (Task by default), enter a summary, and the issue is created in Jira, assigned to you. From the Assign window, the selected time is assigned to the new issue straight away. From the tray, the new key goes on your clipboard. Start the manual timer for calls or work away from the keyboard.
+3. Assign activity to the right Jira issue, or mark it Internal or Excluded, in the **Assign…** window.
 4. Review actual versus proposed time using **Once per issue/day** and **Each work session**. Choose the mode that matches your company's policy. Approve rows on **Activity**, or select lines on **Worklogs** and press **Enter** (**Approve line**). Then use **Ctrl+C** (**Copy for Tempo**, one line per worklog when several are selected) or **Export approved CSV** for Tempo entry. Copied or exported lines show *Copied or exported · mark entered*. After the first copy, **Ctrl+1** to **Ctrl+4** copy the issue key, duration (for example `1h 45m`), description or start time one at a time, for pasting into separate Tempo fields. After entering them in Tempo, keep them selected and press **Ctrl+M** (**Mark entered**). The selection stays in place between these steps. Changes to an entered line appear as adjustments and stay out of new exports.
    If an older local mark has no time range and blocks the whole day, open **Manage local Tempo entries** (right-click in Worklogs) and choose **Keep as separate Tempo entry** or **Record removal from Tempo**.
 
-Default tray shortcuts are **Ctrl+Shift+Alt+L** for review, **Ctrl+Shift+Alt+P** for a pin, and **Ctrl+Shift+Alt+N** to capture a request.
+Default tray shortcuts are **Ctrl+Shift+Alt+L** for review, **Ctrl+Shift+Alt+P** for an optional pin, and **Ctrl+Shift+Alt+N** for a new Jira task.
 
 Idle gaps appear in **Needs review only**. Assign reading or other passive work, or exclude breaks. After an idle or lock interruption, confirm the saved pin before using it across apps again.
+
+## Send to Tempo
+
+1. Connect Jira first. Tempo uses it to find your account and the issue IDs.
+2. Select **Connect Tempo** and paste a Tempo API token. In Jira, open **Apps → Tempo → Settings → API integration → New token**, with Worklogs view and manage access. **Test and save** makes a read-only check of today's worklogs. The token goes to Windows Credential Manager.
+3. In **Worklogs**, approve the lines and select **Send to Tempo**. It sends the selected approved lines, or all new approved lines if none are selected. Each one goes out with the issue, date, start time, rounded duration and description, after a confirmation that lists them. The rounding preview selected at the bottom decides what is sent.
+
+Before sending, the app reads that day's worklogs from Tempo:
+
+- A worklog that already exists identically is recorded as entered, not sent again.
+- If Tempo already has time on the same issue that the app didn't send or record, it asks before adding another worklog.
+- If a send times out or the reply is lost, the line shows *Send unconfirmed*. **Check Tempo status** can reconcile a matching receipt. **Send to Tempo** also checks for a match before offering a retry.
+- A refusal, such as a locked period or missing permission, is shown with Tempo's reason and leaves the line ready to retry.
+
+Sent lines are marked entered automatically. The app only creates worklogs. Corrections to time already in Tempo are still copied with **Copy for Tempo** and applied by hand.
+
+## Finish today’s worklog
+
+Open **Finish today’s worklog** from the tray to see what is verified in Tempo, manually attested, ready or still open. The same window lists earlier unfinished dates. Review opens the selected workday and the relevant Activity or Worklogs view. Use **Check Tempo status** on Worklogs to look for an earlier receipt without sending anything. **Send to Tempo** still asks for confirmation.
+
+Use **Reminder settings** to opt in and choose workdays and a time in the existing workday time zone. There is one Windows cue for actionable work and one optional 30-minute snooze. After the banner disappears, its action remains in Windows Notification Center until it expires or you exit Worklog Desk. Use **Skip today** for a day off. The tray summary is available when Windows suppresses the cue or after it expires.
+
+In **Pilot and check-in**, choose the fixed cutoff before starting. It defaults to 18:00 in the workday time zone. The pilot starts with five worked days without cues and continues with ten worked days in the reminder period. Check in for each date, including days when you worked but capture was empty. Results stay on this PC and show cutoff closure, missing observations and verified versus manually attested entries separately. A Windows cue request records an attempt to notify. The app tracks review opens separately.
 
 ## Connect Jira Cloud
 
 Issue lookup is optional. In **Connect Jira**, enter your `.atlassian.net` site, Atlassian email, an API token allowed by your organization, and project keys. Use **Cloud ID** for a scoped token. Select **Test and save** to make a read-only account check. The token goes to Windows Credential Manager. [Atlassian API token settings and guidance](https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account)
 
-This increment uses manual Tempo entry and pasted Teams/Outlook links. Live Tempo posting, automatic ticket creation, host-aware browser integration and Graph imports are later increments in [SCAFFOLD.md](SCAFFOLD.md).
+Teams and Outlook use pasted links. Automatic ticket creation, host-aware browser integration and Graph imports are later increments in [SCAFFOLD.md](SCAFFOLD.md).
 
 ## Verify
 

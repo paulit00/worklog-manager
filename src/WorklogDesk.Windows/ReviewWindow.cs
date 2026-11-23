@@ -20,7 +20,6 @@ internal sealed partial class ReviewWindow : Form
     private readonly Label roundingComparison = new() { AutoSize = true, ForeColor = Palette.Muted };
     private readonly DataGridView activity = Ui.Grid();
     private readonly DataGridView worklogs = Ui.Grid();
-    private readonly DataGridView requests = Ui.Grid();
     private readonly TabControl tabs = new PageHost { Dock = DockStyle.Fill };
     private readonly Button dateButton = Ui.Button("", (_, _) => { }, 230);
     private readonly ComboBox rounding = new() { Width = 155, DropDownStyle = ComboBoxStyle.DropDownList };
@@ -29,7 +28,10 @@ internal sealed partial class ReviewWindow : Form
     private readonly Button tracking;
     private readonly Button timer;
     private readonly Button jira;
-    private readonly Button pinButton;
+    private readonly Button tempo;
+    private readonly Button sendTempo = Ui.Button("Send to Tempo", (_, _) => { }, 124);
+    private readonly Button checkTempo = Ui.Button("Check Tempo status", (_, _) => { }, 150);
+    private CompletionDay completionDay = null!;
     private List<Allocation> rows = [];
     private Allocation[][] visibleActivity = [];
     private sealed record WorklogGridRow(object Item, string[] Cells);
@@ -39,7 +41,7 @@ internal sealed partial class ReviewWindow : Form
     private HashSet<string> approvedIds = [];
     private HashSet<string> staleApprovalIds = [];
     private Dictionary<string, string> approvalKeys = [];
-    private sealed record UndoStep(DateOnly Day, string[] Added, Allocation[] Before, string Label);
+    private sealed record UndoStep(DateOnly Day, string[] Added, Allocation[] Before, string Label, Allocation[]? Expected = null);
     private readonly Stack<UndoStep> undo = new();
     private readonly Button undoButton = Ui.Button("Undo", (_, _) => { }, 76);
     private readonly Button acceptSuggestions = Ui.Button("Accept suggestions", (_, _) => { }, 150);
@@ -50,6 +52,15 @@ internal sealed partial class ReviewWindow : Form
     private HashSet<string> handoffKeys = [];
     private RoundingMode Mode => rounding.SelectedIndex == 1 ? RoundingMode.Session : RoundingMode.IssueDay;
     private DateOnly Day => DateOnly.FromDateTime(date.Value);
+    internal DateOnly SelectedDay => Day;
+    internal bool CanNavigateCompletion => !TempoBusy && (!IsHandleCreated || IsWindowEnabled(Handle));
+    internal bool IsShown => IsHandleCreated && IsWindowVisible(Handle);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool IsWindowEnabled(nint window);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(nint window);
 
     protected override bool ShowWithoutActivation => openWithoutActivation;
 
@@ -98,14 +109,15 @@ internal sealed partial class ReviewWindow : Form
             AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
             Anchor = AnchorStyles.Top | AnchorStyles.Right, WrapContents = false
         };
-        tracking = Ui.Button("Start foreground", (_, _) => app.ToggleCapture(), 128);
+        tracking = Ui.Button("Start recording", (_, _) => app.ToggleCapture(), 128);
         tracking.Enabled = !app.IsDemo;
         timer = Ui.Button("Start timer", (_, _) => app.ToggleManual(), 95);
         jira = Ui.Button("Connect Jira", (_, _) => app.ConnectJira(), 107);
         jira.Enabled = !app.IsDemo;
-        pinButton = Ui.Button("Pin task", (_, _) => app.ResumeOrEditPin(), 104);
-        topActions.Controls.AddRange([tracking, timer, pinButton,
-            jira, Ui.Button("Settings", (_, _) => app.EditSettings(), 80)]);
+        tempo = Ui.Button("Connect Tempo", (_, _) => app.ConnectTempo(), 118);
+        tempo.Enabled = !app.IsDemo;
+        topActions.Controls.AddRange([tracking, timer,
+            jira, tempo, Ui.Button("Settings", (_, _) => app.EditSettings(), 80)]);
         UpdateConnections();
         header.Controls.Add(topActions, 1, 0);
         shell.Controls.Add(header, 0, 0);
@@ -142,11 +154,12 @@ internal sealed partial class ReviewWindow : Form
         shell.Controls.Add(totals, 0, 2);
 
         var commands = Flow();
-        var views = new[] { ViewButton("Activity", 0), ViewButton("Worklogs", 1), ViewButton("Requests", 2) };
+        var views = new[] { ViewButton("Activity", 0), ViewButton("Worklogs", 1) };
         views[0].Checked = true;
         var viewBar = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 0, 18, 0) };
         viewBar.Controls.AddRange(views);
         var assign = Ui.Button("Assign…", (_, _) => AssignSelected(), 96);
+        var assisted = Ui.Button("AI suggestions…", (_, _) => OpenAssistedReview(), 130);
         Ui.Primary(assign);
         Ui.Primary(acceptSuggestions);
         var approve = Ui.Button("Approve", (_, _) => ApproveSelected(), 89);
@@ -162,14 +175,11 @@ internal sealed partial class ReviewWindow : Form
         var mark = Ui.Button("Mark entered", (_, _) => MarkEntered(), 120);
         var approveLine = Ui.Button("Approve line", (_, _) => ApproveWorklogs(), 110);
         var copyLine = Ui.Button("Copy for Tempo", (_, _) => CopyWorklog(), 126);
-        Ui.Primary(copyLine);
+        Ui.Primary(sendTempo);
+        sendTempo.Click += async (_, _) => await SendToTempo();
+        checkTempo.Click += async (_, _) => await CheckTempoStatus();
         acceptSuggestions.Click += (_, _) => AcceptSuggestions();
-        var newRequest = Ui.Button("New request", (_, _) => app.QuickRequest(), 110);
-        var linkRequest = Ui.Button("Link to Jira…", (_, _) => LinkRequest(), 116);
-        var editRequest = Ui.Button("Edit request", (_, _) => EditRequest(), 106);
-        var jiraForm = Ui.Button("Open Jira create form", (_, _) => OpenJiraForm(), 166);
-        commands.Controls.AddRange([viewBar, acceptSuggestions, assign, approve, more, approveLine, copyLine, mark,
-            newRequest, linkRequest, editRequest, jiraForm, undoButton]);
+        commands.Controls.AddRange([viewBar, acceptSuggestions, assisted, assign, approve, more, approveLine, sendTempo, checkTempo, copyLine, mark, undoButton]);
         needsReview.Margin = new Padding(10, 9, 2, 0);
         needsReview.CheckedChanged += (_, _) => LoadActivity();
         commands.Controls.Add(needsReview);
@@ -179,13 +189,10 @@ internal sealed partial class ReviewWindow : Form
         void ShowCommands()
         {
             var view = tabs.SelectedIndex;
-            foreach (var control in new Control[] { acceptSuggestions, assign, approve, more, needsReview, groupActivity })
+            foreach (var control in new Control[] { acceptSuggestions, assisted, assign, approve, more, needsReview, groupActivity })
                 control.Visible = view == 0;
-            foreach (var control in new Control[] { approveLine, copyLine, mark })
+            foreach (var control in new Control[] { approveLine, sendTempo, checkTempo, copyLine, mark })
                 control.Visible = view == 1;
-            foreach (var control in new Control[] { newRequest, linkRequest, editRequest, jiraForm })
-                control.Visible = view == 2;
-            undoButton.Visible = view != 2;
             if (view >= 0 && view < views.Length)
                 views[view].Checked = true;
         }
@@ -291,22 +298,6 @@ internal sealed partial class ReviewWindow : Form
         worklogs.ContextMenuStrip = worklogMenu;
         AddTab("Worklogs", worklogs);
 
-        requests.AccessibleName = "Saved request drafts";
-        AddColumns(requests, ("Description", 200), ("Client", 110), ("Jira issue", 85), ("Evidence", 100));
-        requests.CellDoubleClick += (_, e) => { if (e.RowIndex >= 0) EditRequest(); };
-        requests.KeyDown += (_, e) =>
-        {
-            if (e.KeyCode == Keys.Enter)
-            {
-                e.SuppressKeyPress = true;
-                EditRequest();
-            }
-        };
-        var requestMenu = new ContextMenuStrip();
-        requestMenu.Items.Add("Link to Jira…", null, (_, _) => LinkRequest());
-        requestMenu.Items.Add("Open Jira create form", null, (_, _) => OpenJiraForm());
-        requests.ContextMenuStrip = requestMenu;
-        AddTab("Requests", requests);
         shell.Controls.Add(tabs, 0, 4);
 
         var bottom = Flow();
@@ -336,12 +327,15 @@ internal sealed partial class ReviewWindow : Form
         var pinText = pin == null ? "" : $"   ·   Pinned {pin.Issue} {pin.Client}".TrimEnd();
         status.Text = $"{state}{pinText}" + (pinPaused ? "   ·   Pin paused. Use Pin task to confirm." : "") +
             (hotkeys ? "" : "   ·   Some global shortcuts unavailable");
-        tracking.Text = app.Settings.Recording ? "Pause foreground" : "Start foreground";
+        tracking.Text = app.Settings.Recording ? "Pause recording" : "Start recording";
         timer.Text = app.RunningManual ? "Stop timer" : interrupted ? "Resume timer" : "Start timer";
-        pinButton.Text = pinPaused ? "Confirm pin" : "Pin task";
     }
 
-    public void UpdateConnections() => jira.Text = app.Settings.Jira == null ? "Connect Jira" : "Jira connected";
+    public void UpdateConnections()
+    {
+        jira.Text = app.Settings.Jira == null ? "Connect Jira" : "Jira connected";
+        tempo.Text = app.Settings.Tempo ? "Tempo connected" : "Connect Tempo";
+    }
 
     public void Reload()
     {
@@ -349,17 +343,26 @@ internal sealed partial class ReviewWindow : Form
         entered = store.ManualEntries(Day);
         LoadWorklogs();
         LoadActivity();
-        var selected = requests.CurrentRow?.Tag as RequestDraft;
-        requests.Rows.Clear();
-        foreach (var request in store.Requests(Day))
-        {
-            var index = requests.Rows.Add(request.Task.Description, request.Task.Client, request.Task.Issue,
-                request.Task.Link.Length == 0 ? "—" : "Link saved");
-            requests.Rows[index].Tag = request;
-            if (selected?.Id == request.Id)
-                requests.CurrentCell = requests.Rows[index].Cells[0];
-        }
+        app.CompletionReviewChanged(Day, completionDay.Counts);
     }
+
+    internal void OpenCompletionDate(DateOnly target)
+    {
+        ChangeDay(target);
+        tabs.SelectedIndex = completionDay.Counts.ToWorklogs ? 1 : 0;
+        needsReview.Checked = tabs.SelectedIndex == 0 && completionDay.Counts.Activity > 0;
+        activity.CurrentCell = null;
+        activity.ClearSelection();
+        worklogs.CurrentCell = null;
+        worklogs.ClearSelection();
+        Notify(completionDay.Counts.ToWorklogs ? FinishWorklogWindow.Describe(completionDay.Counts) : "");
+        (tabs.SelectedIndex == 1 ? worklogs : activity).Focus();
+        worklogs.ClearSelection();
+    }
+
+    internal void AddMissingCompletionTime() => AddTime();
+
+    internal void ShowCompletionDeferred(DateOnly target) => Notify($"Review for {target:yyyy-MM-dd} will open after this action.");
 
     public bool IntersectsDay(WorkSpan span) => span.Start < Timeline.DayStart(Day.AddDays(1), app.Zone) &&
         span.End > Timeline.DayStart(Day, app.Zone);
@@ -398,8 +401,7 @@ internal sealed partial class ReviewWindow : Form
         suggestions = Timeline.Suggest(rows);
         acceptSuggestions.Text = suggestions.Count == 0 ? "Accept suggestions" : $"Accept suggestions ({suggestions.Count})";
         acceptSuggestions.Enabled = suggestions.Count > 0;
-        var visible = rows.Where(row => !needsReview.Checked ||
-            (!approvedIds.Contains(row.Id) && row.Status is not (Disposition.Internal or Disposition.Excluded)));
+        var visible = rows.Where(row => !needsReview.Checked || CompletionDay.NeedsActivityReview(row, approvedIds));
         visibleActivity = ActivityGroups(visible).ToArray();
         activity.RowCount = visibleActivity.Length;
         activity.ClearSelection();
@@ -478,18 +480,12 @@ internal sealed partial class ReviewWindow : Form
         attention.Text = $"Unassigned   {Duration(activeUnassigned)}" + (idle == 0 ? "" : $"   ·   Idle {Duration(idle)}");
         proposed.Text = $"Proposed   {Duration(preview.Sum(row => row.ProposedSeconds) * 1000L)}";
         proposed.AccessibleDescription = $"Issue/day {Duration(issueDay * 1000L)}. Sessions {Duration(sessions * 1000L)}.";
-        approvalKeys = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var line in preview)
-        {
-            var key = line.ApprovalKey(Mode);
-            foreach (var id in line.AllocationIds)
-                approvalKeys.Add(id, key);
-        }
-        approvedIds = rows.Where(row => approvalKeys.TryGetValue(row.Id, out var key) && row.IsApprovedFor(Mode, key))
-            .Select(row => row.Id).ToHashSet(StringComparer.Ordinal);
+        completionDay = new CompletionDay(rows, entered, Mode, store.TempoAttempts(Day), lines: preview);
+        approvalKeys = completionDay.ApprovalKeys;
+        approvedIds = completionDay.Approved;
         staleApprovalIds = rows.Where(row => row.Approved && !approvedIds.Contains(row.Id))
             .Select(row => row.Id).ToHashSet(StringComparer.Ordinal);
-        coverages = preview.ToDictionary(line => line, line => ManualLedger.Check(line, Mode, preview, entered));
+        coverages = completionDay.Coverage;
         handoffs = store.Exports(Day);
         correctionCopies = store.CorrectionCopies(Day).ToHashSet(StringComparer.Ordinal);
         handoffKeys = store.HandoffKeys(Day).ToHashSet(StringComparer.Ordinal);
@@ -510,15 +506,20 @@ internal sealed partial class ReviewWindow : Form
                 Duration(worklog.ProposedSeconds * 1000L), worklog.Description,
                 WorklogState(worklog)]));
         }
-        var linkedMarks = coverages.Values.SelectMany(coverage => coverage.RelatedEntries).Select(entry => entry.Id).ToHashSet();
-        foreach (var entry in entered.Where(item => !linkedMarks.Contains(item.Id)))
+        foreach (var entry in completionDay.Unlinked)
         {
-            var status = entry.Mode == Mode && !preview.Any(line => line.Issue == entry.Issue)
+            var status = entry.Intervals is { Length: 0 } ? "Separate entry · confirmed" :
+                entry.Mode == Mode && !preview.Any(line => line.Issue == entry.Issue)
                 ? $"No current work · review −{entry.Seconds / 60}m"
                 : $"Reconcile entered {entry.Seconds / 60}m";
             display.Add(new WorklogGridRow(entry, [entry.Issue, "", entry.Start is { } start ? LocalStart(start) : "—",
                 "—", "—", "Previously entered in Tempo", status]));
         }
+        var currentKeys = preview.Select(line => line.ApprovalKey(Mode)).ToHashSet(StringComparer.Ordinal);
+        foreach (var (key, attempt) in completionDay.Attempts.Where(item => item.Value.State == TempoAttemptState.Pending &&
+            !currentKeys.Contains(item.Key)))
+            display.Add(new WorklogGridRow(attempt, [attempt.Line?.Issue ?? "—", "", "", "", "",
+                "Earlier unconfirmed attempt", "Tempo status unknown · check Tempo status"]));
         visibleWorklogs = display.ToArray();
         worklogs.RowCount = visibleWorklogs.Length;
         worklogs.ClearSelection();
@@ -540,7 +541,7 @@ internal sealed partial class ReviewWindow : Form
 
     private void ChangeDay(DateOnly day)
     {
-        if (day >= DateOnly.FromDateTime(date.MinDate) && day <= DateOnly.FromDateTime(date.MaxDate))
+        if (!TempoBusy && day >= DateOnly.FromDateTime(date.MinDate) && day <= DateOnly.FromDateTime(date.MaxDate))
             date.Value = day.ToDateTime(TimeOnly.MinValue);
     }
 
@@ -586,6 +587,8 @@ internal sealed partial class ReviewWindow : Form
     /// <summary>Restores the rows as they were before the last change on this day: assignment, suggestions, approval, edits.</summary>
     internal void Undo()
     {
+        if (TempoBusy)
+            return;
         if (!undo.TryPop(out var step) || step.Day != Day)
         {
             undo.Clear();
@@ -595,7 +598,7 @@ internal sealed partial class ReviewWindow : Form
         }
         try
         {
-            store.ReplaceRows(step.Added, step.Before);
+            store.ReplaceRows(step.Added, step.Before, step.Expected);
             Notify($"Undid {step.Label}.");
         }
         catch (Exception error) when (error is InvalidOperationException or Microsoft.Data.Sqlite.SqliteException)
@@ -614,7 +617,8 @@ internal sealed partial class ReviewWindow : Form
         return $"{start:HH:mm:ss}–{end:HH:mm:ss}";
     }
 
-    private string LocalStart(DateTimeOffset start) => TimeZoneInfo.ConvertTime(start, app.Zone).ToString("HH:mm:ss");
+    private string LocalStart(DateTimeOffset start) =>
+        TimeZoneInfo.ConvertTime(start, app.Zone).ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
 
     private string State(Allocation row) => approvedIds.Contains(row.Id) ? "Approved" : row.Status switch
     {
@@ -648,6 +652,8 @@ internal sealed partial class ReviewWindow : Form
 
     private void PickDate()
     {
+        if (TempoBusy)
+            return;
         var calendar = new MonthCalendar { MaxSelectionCount = 1, SelectionStart = date.Value, ShowToday = true };
         var host = new ToolStripControlHost(calendar) { Margin = Padding.Empty, Padding = Padding.Empty };
         var drop = new ToolStripDropDown { Padding = Padding.Empty };

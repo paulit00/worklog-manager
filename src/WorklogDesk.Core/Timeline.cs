@@ -60,9 +60,11 @@ public static class Timeline
     public static DateOnly DayOf(DateTimeOffset instant, TimeZoneInfo zone) =>
         DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(instant, zone).DateTime);
 
-    public static DateTimeOffset DayStart(DateOnly day, TimeZoneInfo zone)
+    public static DateTimeOffset DayStart(DateOnly day, TimeZoneInfo zone) => AtLocalTime(day, TimeOnly.MinValue, zone);
+
+    public static DateTimeOffset AtLocalTime(DateOnly day, TimeOnly time, TimeZoneInfo zone)
     {
-        var local = day.ToDateTime(TimeOnly.MinValue, DateTimeKind.Unspecified);
+        var local = day.ToDateTime(time, DateTimeKind.Unspecified);
         while (zone.IsInvalidTime(local))
             local = local.AddMinutes(1);
         var offset = zone.IsAmbiguousTime(local) ? zone.GetAmbiguousTimeOffsets(local).Max() : zone.GetUtcOffset(local);
